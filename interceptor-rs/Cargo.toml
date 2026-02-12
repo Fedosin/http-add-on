@@ -1,0 +1,60 @@
+[package]
+name = "interceptor-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "interceptor-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "signal"] }
+
+# HTTP stack (hyper 1.x for maximum throughput)
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "http1",
+    "http2",
+    "client-legacy",
+    "server-auto",
+] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+pin-project-lite = "0.2"
+
+# Kubernetes client (kube-rs)
+kube = { version = "0.98", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+schemars = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Lock-free / concurrent data structures
+arc-swap = "1"
+dashmap = "6"
+parking_lot = "0.12"
+
+# Observability
+prometheus = { version = "0.13", features = ["process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+
+# High-performance allocator
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
