@@ -16,6 +16,8 @@
 //!   same port with minimal overhead.
 //! * **`hyper-util` pooled client** — reuses TCP connections to backends, keyed
 //!   by authority.
+//! * **DNS caching connector** — avoids repeated `getaddrinfo` syscalls for
+//!   the same Kubernetes service names.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -28,13 +30,12 @@ use bytes::Bytes;
 use http::header;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response, StatusCode};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use pin_project_lite::pin_project;
 
 use crate::config::Config;
-use crate::diagnostics::{CountingConnector, DiagCounters};
+use crate::diagnostics::{CachingConnector, DiagCounters};
 use crate::endpoints::EndpointsCache;
 use crate::metrics::MetricsCollector;
 use crate::queue::{QueueCounter, QueueGuard};
@@ -51,7 +52,7 @@ pub struct AppState {
     pub endpoints_cache: Arc<EndpointsCache>,
     pub metrics: Arc<MetricsCollector>,
     pub diag: Arc<DiagCounters>,
-    pub http_client: Client<CountingConnector<HttpConnector>, Incoming>,
+    pub http_client: Client<CachingConnector, Incoming>,
 }
 
 impl AppState {
@@ -63,18 +64,27 @@ impl AppState {
         metrics: Arc<MetricsCollector>,
         diag: Arc<DiagCounters>,
     ) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.set_keepalive(Some(config.keep_alive));
-        connector.set_connect_timeout(Some(config.connect_timeout));
-
-        // Wrap the connector so we can count pool misses (new TCP connections).
-        let counting = CountingConnector::new(connector, diag.clone());
+        // CachingConnector replaces HttpConnector + GaiResolver:
+        //   - Caches DNS results (avoids blocking getaddrinfo per connection)
+        //   - Counts pool misses (new TCP connections) for diagnostics
+        //   - Sets TCP_NODELAY directly on new connections
+        let connector = CachingConnector::new(
+            config.dns_cache_ttl,
+            config.connect_timeout,
+            true, // TCP_NODELAY
+            diag.clone(),
+        );
 
         let http_client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(config.max_idle_conns_per_host)
-            .build(counting);
+            // Retry when a pooled connection turns out to be dead (server
+            // closed it between our checkout and our write).  This prevents
+            // spurious 502s from stale connections.
+            .retry_canceled_requests(true)
+            // Ensure the Host header is set on outgoing requests.
+            .set_host(true)
+            .build(connector);
 
         Self {
             config,
@@ -184,9 +194,13 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
             let _ = stream.set_nodelay(true);
             let io = hyper_util::rt::TokioIo::new(stream);
 
+            // Pre-format peer IP once per connection (avoid per-request allocation).
+            let peer_ip = peer_addr.ip().to_string();
+
             let service = hyper::service::service_fn(move |req| {
                 let state = state.clone();
-                async move { handle_proxy_request(req, state, peer_addr).await }
+                let peer_ip = peer_ip.clone();
+                async move { handle_proxy_request(req, state, peer_addr, peer_ip).await }
             });
 
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -218,6 +232,7 @@ async fn handle_proxy_request(
     mut req: Request<Incoming>,
     state: Arc<AppState>,
     peer_addr: SocketAddr,
+    peer_ip: String,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let req_start = std::time::Instant::now();
     state
@@ -235,26 +250,22 @@ async fn handle_proxy_request(
     let method = req.method().clone();
 
     // ---- 1. Route lookup (lock-free ArcSwap read) ----
-    let route = {
-        let _span = tracing::trace_span!("route_lookup").entered();
-        match state.routing_table.route(&host, &path, req.headers()) {
-            Some(r) => r,
-            None => {
-                state
-                    .diag
-                    .requests_no_route
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                state.metrics.record_request(method.as_str(), &path, 404, &host);
-                return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
-            }
+    let route = match state.routing_table.route(&host, &path, req.headers()) {
+        Some(r) => r,
+        None => {
+            state
+                .diag
+                .requests_no_route
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .record_request(method.as_str(), &path, 404, &host);
+            return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
         }
     };
 
     // ---- 2. Increment in-flight counter (atomic) ----
-    let guard = {
-        let _span = tracing::trace_span!("queue_increase").entered();
-        state.queue.increase(&route.queue_key)
-    };
+    let guard = state.queue.increase(&route.queue_key);
 
     // ---- 3. Wait for ready endpoints (cold-start support) ----
     let wait_timeout = route
@@ -263,12 +274,10 @@ async fn handle_proxy_request(
         .unwrap_or(state.config.condition_wait_timeout);
 
     let (target_url, is_cold_start) = {
-        let t0 = std::time::Instant::now();
         let result = state
             .endpoints_cache
             .wait_for_ready(&route.target_namespace, &route.target_service, wait_timeout)
             .await;
-        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "wait_endpoints");
         match result {
             Ok(cold_start) => (route.target_url.clone(), cold_start),
             Err(()) => {
@@ -276,7 +285,9 @@ async fn handle_proxy_request(
                 if let Some(ref failover_url) = route.failover_url {
                     (failover_url.clone(), true)
                 } else {
-                    state.metrics.record_request(method.as_str(), &path, 502, &host);
+                    state
+                        .metrics
+                        .record_request(method.as_str(), &path, 502, &host);
                     return Ok(response(
                         StatusCode::BAD_GATEWAY,
                         "Bad Gateway",
@@ -289,7 +300,6 @@ async fn handle_proxy_request(
 
     // ---- 4. Build backend URI ----
     let backend_uri = {
-        let _span = tracing::trace_span!("build_uri").entered();
         let path_and_query = req
             .uri()
             .path_and_query()
@@ -298,7 +308,9 @@ async fn handle_proxy_request(
         match format!("{target_url}{path_and_query}").parse::<http::Uri>() {
             Ok(uri) => uri,
             Err(_) => {
-                state.metrics.record_request(method.as_str(), &path, 500, &host);
+                state
+                    .metrics
+                    .record_request(method.as_str(), &path, 500, &host);
                 return Ok(response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal Server Error",
@@ -311,10 +323,7 @@ async fn handle_proxy_request(
     *req.uri_mut() = backend_uri.clone();
 
     // ---- 5. Add X-Forwarded-* headers ----
-    {
-        let _span = tracing::trace_span!("forwarded_headers").entered();
-        add_forwarded_headers(&mut req, &host, peer_addr);
-    }
+    add_forwarded_headers(&mut req, &host, &peer_ip);
 
     // ---- 6. Cold-start connectivity probe ----
     // After a cold start, kube-proxy may not have updated its iptables/IPVS
@@ -410,22 +419,15 @@ async fn handle_proxy_request(
         .response_header_timeout
         .unwrap_or(state.config.response_header_timeout);
 
-    let result = {
-        let t0 = std::time::Instant::now();
-        let r = tokio::time::timeout(resp_timeout, state.http_client.request(req)).await;
-        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "forward_request");
-        r
-    };
+    let result =
+        tokio::time::timeout(resp_timeout, state.http_client.request(req)).await;
 
     match result {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            let _span = tracing::trace_span!("record_metrics").entered();
             state
                 .metrics
                 .record_request(method.as_str(), &path, status.as_u16(), &host);
-
-            drop(_span);
 
             let (mut parts, body) = resp.into_parts();
             if is_cold_start {
@@ -434,12 +436,6 @@ async fn handle_proxy_request(
                     http::HeaderValue::from_static("true"),
                 );
             }
-            tracing::trace!(
-                total_us = req_start.elapsed().as_micros() as u64,
-                status = status.as_u16(),
-                host = %host,
-                "request_complete",
-            );
             Ok(Response::from_parts(parts, ProxyBody::proxied(body, guard)))
         }
         Ok(Err(e)) => {
@@ -453,7 +449,9 @@ async fn handle_proxy_request(
                 total_us = req_start.elapsed().as_micros() as u64,
                 "proxy error",
             );
-            state.metrics.record_request(method.as_str(), &path, 502, &host);
+            state
+                .metrics
+                .record_request(method.as_str(), &path, 502, &host);
             Ok(response(
                 StatusCode::BAD_GATEWAY,
                 "Bad Gateway",
@@ -471,7 +469,9 @@ async fn handle_proxy_request(
                 total_us = req_start.elapsed().as_micros() as u64,
                 "response header timeout",
             );
-            state.metrics.record_request(method.as_str(), &path, 502, &host);
+            state
+                .metrics
+                .record_request(method.as_str(), &path, 502, &host);
             Ok(response(
                 StatusCode::BAD_GATEWAY,
                 "Bad Gateway",
@@ -496,16 +496,20 @@ fn response(
         .expect("static response")
 }
 
-fn add_forwarded_headers(req: &mut Request<Incoming>, host: &str, peer: SocketAddr) {
+fn add_forwarded_headers(req: &mut Request<Incoming>, host: &str, peer_ip: &str) {
     let headers = req.headers_mut();
 
-    // X-Forwarded-For: append client IP
-    let xff = if let Some(existing) = headers.get("x-forwarded-for") {
-        format!("{}, {}", existing.to_str().unwrap_or(""), peer.ip())
-    } else {
-        peer.ip().to_string()
-    };
-    if let Ok(val) = http::HeaderValue::from_str(&xff) {
+    // X-Forwarded-For: append client IP (avoid format! when possible)
+    if let Some(existing) = headers.get("x-forwarded-for") {
+        let existing_bytes = existing.as_bytes();
+        let mut buf = Vec::with_capacity(existing_bytes.len() + 2 + peer_ip.len());
+        buf.extend_from_slice(existing_bytes);
+        buf.extend_from_slice(b", ");
+        buf.extend_from_slice(peer_ip.as_bytes());
+        if let Ok(val) = http::HeaderValue::from_bytes(&buf) {
+            headers.insert("x-forwarded-for", val);
+        }
+    } else if let Ok(val) = http::HeaderValue::from_str(peer_ip) {
         headers.insert("x-forwarded-for", val);
     }
 

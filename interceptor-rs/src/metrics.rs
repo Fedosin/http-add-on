@@ -61,7 +61,6 @@ impl MetricsCollector {
 
     /// Record a completed request (called after the response status is known).
     pub fn record_request(&self, method: &str, path: &str, code: u16, host: &str) {
-        let _span = tracing::trace_span!("prometheus_inc").entered();
         self.request_count
             .with_label_values(&[method, path, &code.to_string(), host])
             .inc();
