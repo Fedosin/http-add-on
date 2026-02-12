@@ -180,13 +180,11 @@ impl TableMemory {
             let httpso_key = format!("{}/{}", namespace, name);
 
             for host in &hosts {
-                let queue_key = format!("{}|{}", httpso_key, host);
-
                 for prefix in &path_prefixes {
                     let entry = RouteEntry {
                         path_prefix: normalize_path(prefix),
                         header_matchers: header_matchers.clone(),
-                        queue_key: queue_key.clone(),
+                        queue_key: httpso_key.clone(),
                         httpso_key: httpso_key.clone(),
                         target_url: target_url.clone(),
                         condition_wait_timeout,

@@ -390,7 +390,7 @@ async fn handle_proxy_request(
             Ok(Response::from_parts(parts, ProxyBody::proxied(body, guard)))
         }
         Ok(Err(e)) => {
-            tracing::error!(error = %e, host = %host, "proxy error");
+            tracing::warn!(error = %e, host = %host, "proxy error");
             state.metrics.record_request(method.as_str(), &path, 502, &host);
             Ok(response(
                 StatusCode::BAD_GATEWAY,

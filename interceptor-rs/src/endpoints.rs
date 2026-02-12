@@ -51,26 +51,9 @@ impl EndpointsCache {
         timeout: Duration,
     ) -> Result<bool, ()> {
         let key = service_key(namespace, service);
-        let current_count = self
-            .ready_counts
-            .get(&key)
-            .map(|r| *r)
-            .unwrap_or(0);
-        tracing::info!(
-            namespace = namespace,
-            service = service,
-            current_ready_count = current_count,
-            "wait_for_ready called",
-        );
 
         // ---- fast path (warm backend) ----
-        if current_count > 0 {
-            tracing::info!(
-                namespace = namespace,
-                service = service,
-                count = current_count,
-                "wait_for_ready: fast path — endpoints already ready",
-            );
+        if self.has_ready_endpoints(namespace, service) {
             return Ok(false);
         }
 
@@ -106,7 +89,7 @@ impl EndpointsCache {
                     // Receiver fell behind — some notifications were dropped.
                     // Re-check the current state; the service may have become
                     // ready while we were lagging.
-                    tracing::info!(
+                    tracing::debug!(
                         skipped = n,
                         namespace = namespace,
                         service = service,

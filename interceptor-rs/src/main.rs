@@ -175,28 +175,18 @@ fn sync_queue_keys(queue: &queue::QueueCounter, objects: &[Arc<HTTPScaledObject>
         let namespace = httpso.metadata.namespace.as_deref().unwrap_or("default");
         let name = httpso.metadata.name.as_deref().unwrap_or("unknown");
 
-        let hosts: Vec<&str> = if httpso.spec.hosts.is_empty() {
-            vec!["*"]
-        } else {
-            httpso.spec.hosts.iter().map(|s| s.as_str()).collect()
-        };
+        let key = format!("{namespace}/{name}");
+        queue.ensure_key(&key);
+        new_keys.insert(key.clone());
 
-        let httpso_key = format!("{namespace}/{name}");
-
-        for host in &hosts {
-            let key = format!("{httpso_key}|{host}");
-            queue.ensure_key(&key);
-            new_keys.insert(key.clone());
-
-            // Configure RPS buckets if a requestRate metric is defined.
-            if let Some(ref sm) = httpso.spec.scaling_metric {
-                if let Some(ref rr) = sm.request_rate {
-                    let window = config::parse_go_duration(&rr.window)
-                        .unwrap_or(Duration::from_secs(60));
-                    let granularity = config::parse_go_duration(&rr.granularity)
-                        .unwrap_or(Duration::from_secs(1));
-                    queue.update_buckets(&key, window, granularity);
-                }
+        // Configure RPS buckets if a requestRate metric is defined.
+        if let Some(ref sm) = httpso.spec.scaling_metric {
+            if let Some(ref rr) = sm.request_rate {
+                let window = config::parse_go_duration(&rr.window)
+                    .unwrap_or(Duration::from_secs(60));
+                let granularity = config::parse_go_duration(&rr.granularity)
+                    .unwrap_or(Duration::from_secs(1));
+                queue.update_buckets(&key, window, granularity);
             }
         }
     }
