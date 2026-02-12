@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/go-logr/logr"
@@ -26,40 +25,24 @@ func NewCountingMiddleware(queueCounter queue.Counter, upstreamHandler http.Hand
 
 var _ http.Handler = (*Counting)(nil)
 
+// ServeHTTP increments the queue counter synchronously before forwarding
+// the request, and decrements it via defer when the request completes.
+// This avoids spawning goroutines per request, which was the previous
+// bottleneck under high RPS.
 func (cm *Counting) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = util.RequestWithLoggerWithName(r, "CountingMiddleware")
 	ctx := r.Context()
-
-	defer cm.countAsync(ctx)()
-
-	cm.upstreamHandler.ServeHTTP(w, r)
-}
-
-func (cm *Counting) countAsync(ctx context.Context) func() {
-	signaler := util.NewSignaler()
-
-	go cm.count(ctx, signaler)
-
-	return func() {
-		go signaler.Signal()
-	}
-}
-
-func (cm *Counting) count(ctx context.Context, signaler util.Signaler) {
 	logger := util.LoggerFromContext(ctx)
 	httpso := util.HTTPSOFromContext(ctx)
-
 	key := k8s.NamespacedNameFromObject(httpso).String()
 
 	if !cm.inc(logger, key) {
+		cm.upstreamHandler.ServeHTTP(w, r)
 		return
 	}
+	defer cm.dec(logger, key)
 
-	if err := signaler.Wait(ctx); err != nil && err != context.Canceled {
-		logger.Error(err, "failed to wait signal")
-	}
-
-	cm.dec(logger, key)
+	cm.upstreamHandler.ServeHTTP(w, r)
 }
 
 func (cm *Counting) inc(logger logr.Logger, key string) bool {
