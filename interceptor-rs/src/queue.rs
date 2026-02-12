@@ -73,8 +73,12 @@ impl QueueCounter {
     /// RPS data-point.  Returns a [`QueueGuard`] that decrements on drop.
     pub fn increase(self: &Arc<Self>, key: &str) -> QueueGuard {
         if let Some(entry) = self.entries.get(key) {
+            let _span = tracing::trace_span!("queue_atomic_inc").entered();
             entry.concurrency.fetch_add(1, Ordering::Relaxed);
+            drop(_span);
+
             // Record RPS data-point
+            let _span = tracing::trace_span!("queue_rps_record").entered();
             let mut buckets = entry.rps_buckets.lock();
             if let Some(ref mut b) = *buckets {
                 b.record(Instant::now(), 1.0);

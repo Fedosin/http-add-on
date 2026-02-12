@@ -212,6 +212,8 @@ async fn handle_proxy_request(
     state: Arc<AppState>,
     peer_addr: SocketAddr,
 ) -> Result<Response<ProxyBody>, Infallible> {
+    let req_start = std::time::Instant::now();
+
     let host = req
         .headers()
         .get(header::HOST)
@@ -222,16 +224,22 @@ async fn handle_proxy_request(
     let method = req.method().clone();
 
     // ---- 1. Route lookup (lock-free ArcSwap read) ----
-    let route = match state.routing_table.route(&host, &path, req.headers()) {
-        Some(r) => r,
-        None => {
-            state.metrics.record_request(method.as_str(), &path, 404, &host);
-            return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
+    let route = {
+        let _span = tracing::trace_span!("route_lookup").entered();
+        match state.routing_table.route(&host, &path, req.headers()) {
+            Some(r) => r,
+            None => {
+                state.metrics.record_request(method.as_str(), &path, 404, &host);
+                return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
+            }
         }
     };
 
     // ---- 2. Increment in-flight counter (atomic) ----
-    let guard = state.queue.increase(&route.queue_key);
+    let guard = {
+        let _span = tracing::trace_span!("queue_increase").entered();
+        state.queue.increase(&route.queue_key)
+    };
 
     // ---- 3. Wait for ready endpoints (cold-start support) ----
     let wait_timeout = route
@@ -239,49 +247,59 @@ async fn handle_proxy_request(
         .or(route.failover_timeout)
         .unwrap_or(state.config.condition_wait_timeout);
 
-    let (target_url, is_cold_start) = match state
-        .endpoints_cache
-        .wait_for_ready(&route.target_namespace, &route.target_service, wait_timeout)
-        .await
-    {
-        Ok(cold_start) => (route.target_url.clone(), cold_start),
-        Err(()) => {
-            // Timeout — try failover if configured
-            if let Some(ref failover_url) = route.failover_url {
-                (failover_url.clone(), true)
-            } else {
-                state.metrics.record_request(method.as_str(), &path, 502, &host);
+    let (target_url, is_cold_start) = {
+        let t0 = std::time::Instant::now();
+        let result = state
+            .endpoints_cache
+            .wait_for_ready(&route.target_namespace, &route.target_service, wait_timeout)
+            .await;
+        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "wait_endpoints");
+        match result {
+            Ok(cold_start) => (route.target_url.clone(), cold_start),
+            Err(()) => {
+                // Timeout — try failover if configured
+                if let Some(ref failover_url) = route.failover_url {
+                    (failover_url.clone(), true)
+                } else {
+                    state.metrics.record_request(method.as_str(), &path, 502, &host);
+                    return Ok(response(
+                        StatusCode::BAD_GATEWAY,
+                        "Bad Gateway",
+                        Some(guard),
+                    ));
+                }
+            }
+        }
+    };
+
+    // ---- 4. Build backend URI ----
+    let backend_uri = {
+        let _span = tracing::trace_span!("build_uri").entered();
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        match format!("{target_url}{path_and_query}").parse::<http::Uri>() {
+            Ok(uri) => uri,
+            Err(_) => {
+                state.metrics.record_request(method.as_str(), &path, 500, &host);
                 return Ok(response(
-                    StatusCode::BAD_GATEWAY,
-                    "Bad Gateway",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
                     Some(guard),
                 ));
             }
         }
     };
 
-    // ---- 4. Build backend URI ----
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let backend_uri = match format!("{target_url}{path_and_query}").parse::<http::Uri>() {
-        Ok(uri) => uri,
-        Err(_) => {
-            state.metrics.record_request(method.as_str(), &path, 500, &host);
-            return Ok(response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
-                Some(guard),
-            ));
-        }
-    };
-
     *req.uri_mut() = backend_uri.clone();
 
     // ---- 5. Add X-Forwarded-* headers ----
-    add_forwarded_headers(&mut req, &host, peer_addr);
+    {
+        let _span = tracing::trace_span!("forwarded_headers").entered();
+        add_forwarded_headers(&mut req, &host, peer_addr);
+    }
 
     // ---- 6. Cold-start connectivity probe ----
     // After a cold start, kube-proxy may not have updated its iptables/IPVS
@@ -289,6 +307,7 @@ async fn handle_proxy_request(
     // ready.  Probe TCP connectivity first so we don't waste the original
     // request body on a guaranteed-to-fail connection.
     if is_cold_start {
+        let probe_start = std::time::Instant::now();
         let authority = backend_uri
             .authority()
             .map(|a| a.as_str().to_string())
@@ -311,6 +330,7 @@ async fn handle_proxy_request(
                         host = %host,
                         authority = %authority,
                         attempt,
+                        elapsed_us = probe_start.elapsed().as_micros() as u64,
                         "cold-start: backend reachable",
                     );
                     break;
@@ -371,14 +391,22 @@ async fn handle_proxy_request(
         .response_header_timeout
         .unwrap_or(state.config.response_header_timeout);
 
-    let result = tokio::time::timeout(resp_timeout, state.http_client.request(req)).await;
+    let result = {
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(resp_timeout, state.http_client.request(req)).await;
+        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "forward_request");
+        r
+    };
 
     match result {
         Ok(Ok(resp)) => {
             let status = resp.status();
+            let _span = tracing::trace_span!("record_metrics").entered();
             state
                 .metrics
                 .record_request(method.as_str(), &path, status.as_u16(), &host);
+
+            drop(_span);
 
             let (mut parts, body) = resp.into_parts();
             if is_cold_start {
@@ -387,10 +415,21 @@ async fn handle_proxy_request(
                     http::HeaderValue::from_static("true"),
                 );
             }
+            tracing::trace!(
+                total_us = req_start.elapsed().as_micros() as u64,
+                status = status.as_u16(),
+                host = %host,
+                "request_complete",
+            );
             Ok(Response::from_parts(parts, ProxyBody::proxied(body, guard)))
         }
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, host = %host, "proxy error");
+            tracing::warn!(
+                error = %e,
+                host = %host,
+                total_us = req_start.elapsed().as_micros() as u64,
+                "proxy error",
+            );
             state.metrics.record_request(method.as_str(), &path, 502, &host);
             Ok(response(
                 StatusCode::BAD_GATEWAY,
@@ -399,7 +438,12 @@ async fn handle_proxy_request(
             ))
         }
         Err(_elapsed) => {
-            tracing::warn!(host = %host, timeout = ?resp_timeout, "response header timeout");
+            tracing::warn!(
+                host = %host,
+                timeout = ?resp_timeout,
+                total_us = req_start.elapsed().as_micros() as u64,
+                "response header timeout",
+            );
             state.metrics.record_request(method.as_str(), &path, 502, &host);
             Ok(response(
                 StatusCode::BAD_GATEWAY,

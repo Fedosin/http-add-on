@@ -7,6 +7,12 @@ edition = "2021"
 name = "interceptor-rs"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the /debug/pprof/flamegraph endpoint on the admin server.
+# Build with:  cargo build --release --features profiling
+profiling = ["dep:pprof"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full", "signal"] }
@@ -49,6 +55,9 @@ anyhow = "1"
 thiserror = "2"
 futures = "0.3"
 
+# Profiling (opt-in)
+pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"], optional = true }
+
 # High-performance allocator
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
@@ -58,3 +67,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Profile for performance analysis: keeps debug symbols for perf/pprof.
+# Build with:  cargo build --profile profiling --features profiling
+[profile.profiling]
+inherits = "release"
+debug = 2       # full DWARF info for flamegraphs / perf
+strip = false   # keep symbols

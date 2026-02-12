@@ -54,7 +54,11 @@ impl RoutingTable {
     /// Hot-path route lookup — lock-free.
     #[inline]
     pub fn route(&self, host: &str, path: &str, headers: &HeaderMap) -> Option<RouteInfo> {
+        let _span = tracing::trace_span!("arcswap_load").entered();
         let table = self.memory.load();
+        drop(_span);
+
+        let _span = tracing::trace_span!("table_lookup").entered();
         table.lookup(host, path, headers)
     }
 
