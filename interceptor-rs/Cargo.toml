@@ -50,6 +50,9 @@ prometheus = { version = "0.13", features = ["process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Tower (Service trait for connector wrapping)
+tower-service = "0.3"
+
 # Utilities
 anyhow = "1"
 thiserror = "2"

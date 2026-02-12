@@ -34,6 +34,7 @@ use hyper_util::rt::TokioExecutor;
 use pin_project_lite::pin_project;
 
 use crate::config::Config;
+use crate::diagnostics::{CountingConnector, DiagCounters};
 use crate::endpoints::EndpointsCache;
 use crate::metrics::MetricsCollector;
 use crate::queue::{QueueCounter, QueueGuard};
@@ -49,7 +50,8 @@ pub struct AppState {
     pub queue: Arc<QueueCounter>,
     pub endpoints_cache: Arc<EndpointsCache>,
     pub metrics: Arc<MetricsCollector>,
-    pub http_client: Client<HttpConnector, Incoming>,
+    pub diag: Arc<DiagCounters>,
+    pub http_client: Client<CountingConnector<HttpConnector>, Incoming>,
 }
 
 impl AppState {
@@ -59,16 +61,20 @@ impl AppState {
         queue: Arc<QueueCounter>,
         endpoints_cache: Arc<EndpointsCache>,
         metrics: Arc<MetricsCollector>,
+        diag: Arc<DiagCounters>,
     ) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         connector.set_keepalive(Some(config.keep_alive));
         connector.set_connect_timeout(Some(config.connect_timeout));
 
+        // Wrap the connector so we can count pool misses (new TCP connections).
+        let counting = CountingConnector::new(connector, diag.clone());
+
         let http_client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(config.max_idle_conns_per_host)
-            .build(connector);
+            .build(counting);
 
         Self {
             config,
@@ -76,6 +82,7 @@ impl AppState {
             queue,
             endpoints_cache,
             metrics,
+            diag,
             http_client,
         }
     }
@@ -213,6 +220,10 @@ async fn handle_proxy_request(
     peer_addr: SocketAddr,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let req_start = std::time::Instant::now();
+    state
+        .diag
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let host = req
         .headers()
@@ -229,6 +240,10 @@ async fn handle_proxy_request(
         match state.routing_table.route(&host, &path, req.headers()) {
             Some(r) => r,
             None => {
+                state
+                    .diag
+                    .requests_no_route
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 state.metrics.record_request(method.as_str(), &path, 404, &host);
                 return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
             }
@@ -307,6 +322,10 @@ async fn handle_proxy_request(
     // ready.  Probe TCP connectivity first so we don't waste the original
     // request body on a guaranteed-to-fail connection.
     if is_cold_start {
+        state
+            .diag
+            .requests_cold_start
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let probe_start = std::time::Instant::now();
         let authority = backend_uri
             .authority()
@@ -424,6 +443,10 @@ async fn handle_proxy_request(
             Ok(Response::from_parts(parts, ProxyBody::proxied(body, guard)))
         }
         Ok(Err(e)) => {
+            state
+                .diag
+                .requests_backend_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 error = %e,
                 host = %host,
@@ -438,6 +461,10 @@ async fn handle_proxy_request(
             ))
         }
         Err(_elapsed) => {
+            state
+                .diag
+                .requests_backend_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 host = %host,
                 timeout = ?resp_timeout,

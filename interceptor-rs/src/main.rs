@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 mod admin;
 mod config;
 mod crd;
+mod diagnostics;
 mod endpoints;
 mod metrics;
 mod proxy;
@@ -47,6 +48,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Log the effective RUST_LOG so we know what tracing overhead to expect.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "(unset → default: info)".into());
+    tracing::info!(RUST_LOG = %rust_log, "Tracing filter active");
+
     let cfg = config::Config::from_env()?;
     tracing::info!(
         proxy_port = cfg.proxy_port,
@@ -62,6 +67,7 @@ async fn main() -> Result<()> {
     let routing_table = Arc::new(routing::RoutingTable::new());
     let endpoints_cache = Arc::new(endpoints::EndpointsCache::new());
     let metrics_collector = Arc::new(metrics::MetricsCollector::new()?);
+    let diag_counters = Arc::new(diagnostics::DiagCounters::default());
 
     let state = Arc::new(proxy::AppState::new(
         cfg.clone(),
@@ -69,6 +75,7 @@ async fn main() -> Result<()> {
         queue_counter.clone(),
         endpoints_cache.clone(),
         metrics_collector.clone(),
+        diag_counters,
     ));
 
     // -- background tasks ----------------------------------------------------

@@ -87,6 +87,25 @@ async fn handle(
             }
         }
 
+        // ----- Diagnostic counters (connection reuse, request counts) ------
+        "/debug/stats" => {
+            let snap = state.diag.snapshot();
+            match serde_json::to_vec_pretty(&snap) {
+                Ok(json) => Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(json)))
+                    .unwrap()),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to serialize diag snapshot");
+                    Ok(status(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                    ))
+                }
+            }
+        }
+
         // ----- CPU flamegraph (opt-in via `profiling` feature) -------------
         #[cfg(feature = "profiling")]
         p if p.starts_with("/debug/pprof/flamegraph") => {
