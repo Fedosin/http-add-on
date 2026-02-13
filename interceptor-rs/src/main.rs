@@ -25,6 +25,7 @@ use kube::{Api, Client};
 use tracing_subscriber::EnvFilter;
 
 mod admin;
+mod backend_pool;
 mod config;
 mod crd;
 mod diagnostics;

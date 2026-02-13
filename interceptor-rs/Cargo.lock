@@ -931,6 +931,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "k8s-openapi",

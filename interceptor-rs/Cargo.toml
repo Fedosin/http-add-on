@@ -23,13 +23,13 @@ hyper-util = { version = "0.1", features = [
     "tokio",
     "http1",
     "http2",
-    "client-legacy",
     "server-auto",
 ] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
 pin-project-lite = "0.2"
+httparse = "1"
 
 # Kubernetes client (kube-rs)
 kube = { version = "0.98", features = ["runtime", "derive", "client"] }
@@ -49,9 +49,6 @@ parking_lot = "0.12"
 prometheus = { version = "0.13", features = ["process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Tower (Service trait for connector wrapping)
-tower-service = "0.3"
 
 # Utilities
 anyhow = "1"

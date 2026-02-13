@@ -41,6 +41,11 @@ pub struct RouteInfo {
     pub target_namespace: String,
     pub target_service: String,
     pub target_port: u16,
+    /// Pre-computed `"namespace/service"` for EndpointsCache lookups (avoids
+    /// per-request `format!`).
+    pub service_key: String,
+    /// Pre-computed `"service.namespace:port"` authority for the backend pool.
+    pub authority: String,
 }
 
 impl RoutingTable {
@@ -97,6 +102,8 @@ struct RouteEntry {
     target_namespace: String,
     target_service: String,
     target_port: u16,
+    service_key: String,
+    authority: String,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +185,11 @@ impl TableMemory {
             };
 
             let httpso_key = format!("{}/{}", namespace, name);
+            let service_key = format!("{}/{}", namespace, spec.scale_target_ref.service);
+            let authority = format!(
+                "{}.{}:{}",
+                spec.scale_target_ref.service, namespace, port
+            );
 
             for host in &hosts {
                 for prefix in &path_prefixes {
@@ -194,6 +206,8 @@ impl TableMemory {
                         target_namespace: namespace.to_string(),
                         target_service: spec.scale_target_ref.service.clone(),
                         target_port: port as u16,
+                        service_key: service_key.clone(),
+                        authority: authority.clone(),
                     };
                     routes.entry(host.clone()).or_default().push(entry);
                 }
@@ -272,6 +286,8 @@ impl TableMemory {
                 target_namespace: entry.target_namespace.clone(),
                 target_service: entry.target_service.clone(),
                 target_port: entry.target_port,
+                service_key: entry.service_key.clone(),
+                authority: entry.authority.clone(),
             });
         }
         None

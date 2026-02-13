@@ -1,41 +1,43 @@
 //! Proxy server — the main performance-critical path.
 //!
-//! Design choices for throughput:
+//! ## Raw TCP forwarding (v2 architecture)
 //!
-//! * **Zero-copy body forwarding** — the client request's `Incoming` body is
-//!   moved (not copied) into the outbound request to the backend.
-//! * **No per-request allocation for warm backends** — route lookup is a
-//!   `HashMap` read behind `ArcSwap`, concurrency tracking is one atomic op,
-//!   endpoint check is one `DashMap` read.
-//! * **Custom body enum** — avoids `BoxBody` dynamic dispatch; the enum has
-//!   only two variants (`Proxied` for backend responses, `Fixed` for error
-//!   pages) with statically dispatched `Body::poll_frame`.
-//! * **jemalloc global allocator** — reduces contention vs. glibc malloc under
-//!   many concurrent connections.
-//! * **hyper 1.x `auto::Builder`** — supports both HTTP/1.1 and h2 on the
-//!   same port with minimal overhead.
-//! * **`hyper-util` pooled client** — reuses TCP connections to backends, keyed
-//!   by authority.
-//! * **DNS caching connector** — avoids repeated `getaddrinfo` syscalls for
-//!   the same Kubernetes service names.
+//! Instead of using hyper's `Client` (which parses + re-encodes headers on
+//! both the request and response legs), we:
+//!
+//! 1. **Keep hyper as the server** — it parses the incoming request so we can
+//!    do routing, header matching, and queue counting.
+//! 2. **Write the outgoing request as raw bytes** directly to a pooled
+//!    `TcpStream` (avoids hyper client's `encode_headers` pass).
+//! 3. **Parse the response status + headers with `httparse`** — much cheaper
+//!    than going through hyper's client dispatcher; we construct an
+//!    `http::Response` from the parsed data.
+//! 4. **Stream the response body** back through hyper's server as a custom
+//!    `Body` impl that reads directly from the backend `TcpStream`.
+//!
+//! This eliminates ~20% of CPU overhead from the hyper client's pool
+//! (checkout/put/drop), request re-encoding, and dispatch machinery.
 
 use std::convert::Infallible;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::header;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response, StatusCode};
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use pin_project_lite::pin_project;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
+use crate::backend_pool::BackendPool;
 use crate::config::Config;
-use crate::diagnostics::{CachingConnector, DiagCounters};
+use crate::diagnostics::DiagCounters;
 use crate::endpoints::EndpointsCache;
 use crate::metrics::MetricsCollector;
 use crate::queue::{QueueCounter, QueueGuard};
@@ -51,8 +53,8 @@ pub struct AppState {
     pub queue: Arc<QueueCounter>,
     pub endpoints_cache: Arc<EndpointsCache>,
     pub metrics: Arc<MetricsCollector>,
+    pub backend_pool: Arc<BackendPool>,
     pub diag: Arc<DiagCounters>,
-    pub http_client: Client<CachingConnector, Incoming>,
 }
 
 impl AppState {
@@ -64,27 +66,12 @@ impl AppState {
         metrics: Arc<MetricsCollector>,
         diag: Arc<DiagCounters>,
     ) -> Self {
-        // CachingConnector replaces HttpConnector + GaiResolver:
-        //   - Caches DNS results (avoids blocking getaddrinfo per connection)
-        //   - Counts pool misses (new TCP connections) for diagnostics
-        //   - Sets TCP_NODELAY directly on new connections
-        let connector = CachingConnector::new(
+        let backend_pool = Arc::new(BackendPool::new(
             config.dns_cache_ttl,
             config.connect_timeout,
-            true, // TCP_NODELAY
+            config.max_idle_conns_per_host,
             diag.clone(),
-        );
-
-        let http_client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(config.max_idle_conns_per_host)
-            // Retry when a pooled connection turns out to be dead (server
-            // closed it between our checkout and our write).  This prevents
-            // spurious 502s from stale connections.
-            .retry_canceled_requests(true)
-            // Ensure the Host header is set on outgoing requests.
-            .set_host(true)
-            .build(connector);
+        ));
 
         Self {
             config,
@@ -92,8 +79,8 @@ impl AppState {
             queue,
             endpoints_cache,
             metrics,
+            backend_pool,
             diag,
-            http_client,
         }
     }
 }
@@ -105,17 +92,16 @@ impl AppState {
 pin_project! {
     /// Response body returned by the proxy handler.
     ///
-    /// `Proxied` streams the backend response (zero-copy).
-    /// `Fixed` returns a short error payload (404 / 502 / 500).
+    /// * `RawStream` — reads from the backend `TcpStream` (raw TCP mode).
+    /// * `Fixed` — short error payload (404 / 502 / 500).
     ///
     /// Both variants optionally hold a [`QueueGuard`] that decrements the
     /// in-flight counter when the body is dropped (i.e. after the response has
     /// been fully sent to the client).
     #[project = ProxyBodyProj]
     pub enum ProxyBody {
-        Proxied {
-            #[pin]
-            inner: Incoming,
+        RawStream {
+            inner: RawResponseBody,
             _guard: Option<QueueGuard>,
         },
         Fixed {
@@ -126,8 +112,8 @@ pin_project! {
 }
 
 impl ProxyBody {
-    fn proxied(body: Incoming, guard: QueueGuard) -> Self {
-        Self::Proxied {
+    fn raw_stream(body: RawResponseBody, guard: QueueGuard) -> Self {
+        Self::RawStream {
             inner: body,
             _guard: Some(guard),
         }
@@ -143,14 +129,16 @@ impl ProxyBody {
 
 impl Body for ProxyBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = std::io::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
-            ProxyBodyProj::Proxied { inner, .. } => inner.poll_frame(cx),
+            ProxyBodyProj::RawStream { inner, .. } => {
+                Pin::new(inner).poll_frame(cx)
+            }
             ProxyBodyProj::Fixed { data, .. } => {
                 Poll::Ready(data.take().map(|b| Ok(Frame::data(b))))
             }
@@ -159,19 +147,172 @@ impl Body for ProxyBody {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            ProxyBody::Proxied { inner, .. } => inner.is_end_stream(),
+            ProxyBody::RawStream { inner, .. } => inner.is_done(),
             ProxyBody::Fixed { data, .. } => data.is_none(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            ProxyBody::Proxied { inner, .. } => inner.size_hint(),
+            ProxyBody::RawStream { inner, .. } => inner.size_hint(),
             ProxyBody::Fixed { data, .. } => {
                 let mut hint = SizeHint::default();
                 hint.set_exact(data.as_ref().map_or(0, |b| b.len()) as u64);
                 hint
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw response body — reads from backend TcpStream
+// ---------------------------------------------------------------------------
+
+/// Streams a Content-Length-delimited or chunked HTTP response body from a
+/// raw `TcpStream`.  When the body is fully consumed, the stream is returned
+/// to the `BackendPool` for reuse.
+pub struct RawResponseBody {
+    /// Backend TCP stream (taken when body is done, for pool return).
+    stream: Option<TcpStream>,
+    /// Any leftover bytes from the header-parsing read buffer.
+    buffered: BytesMut,
+    /// Body framing.
+    framing: BodyFraming,
+    /// Pool + authority for returning the connection.
+    pool: Option<Arc<BackendPool>>,
+    authority: String,
+}
+
+enum BodyFraming {
+    /// Known content length; `remaining` counts down to zero.
+    ContentLength { remaining: u64 },
+    /// Read until the connection closes (HTTP/1.0 or missing Content-Length).
+    /// Cannot reuse the connection.
+    ReadUntilClose,
+}
+
+impl RawResponseBody {
+    fn new(
+        stream: TcpStream,
+        buffered: BytesMut,
+        framing: BodyFraming,
+        pool: Arc<BackendPool>,
+        authority: String,
+    ) -> Self {
+        Self {
+            stream: Some(stream),
+            buffered,
+            framing,
+            pool: Some(pool),
+            authority,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        match self.framing {
+            BodyFraming::ContentLength { remaining } => remaining == 0 && self.buffered.is_empty(),
+            BodyFraming::ReadUntilClose => self.stream.is_none(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self.framing {
+            BodyFraming::ContentLength { remaining } => {
+                let total = remaining + self.buffered.len() as u64;
+                SizeHint::with_exact(total)
+            }
+            BodyFraming::ReadUntilClose => SizeHint::default(),
+        }
+    }
+
+    /// Return the stream to the pool (only for Content-Length bodies that
+    /// have been fully consumed).
+    fn maybe_return_to_pool(&mut self) {
+        if let BodyFraming::ContentLength { remaining: 0 } = self.framing {
+            if let (Some(pool), Some(stream)) = (self.pool.take(), self.stream.take()) {
+                pool.checkin(&self.authority, stream);
+            }
+        }
+    }
+}
+
+impl Body for RawResponseBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+
+        // 1. Serve buffered data first (leftover from header parsing)
+        if !this.buffered.is_empty() {
+            let chunk = match this.framing {
+                BodyFraming::ContentLength { ref mut remaining } => {
+                    let take = (*remaining as usize).min(this.buffered.len());
+                    *remaining -= take as u64;
+                    this.buffered.split_to(take).freeze()
+                }
+                BodyFraming::ReadUntilClose => this.buffered.split().freeze(),
+            };
+            if !chunk.is_empty() {
+                // Check if we're done
+                if let BodyFraming::ContentLength { remaining: 0 } = this.framing {
+                    this.maybe_return_to_pool();
+                }
+                return Poll::Ready(Some(Ok(Frame::data(chunk))));
+            }
+        }
+
+        // 2. Check if body is complete
+        if let BodyFraming::ContentLength { remaining: 0 } = this.framing {
+            this.maybe_return_to_pool();
+            return Poll::Ready(None);
+        }
+
+        // 3. Read more from the stream
+        let stream = match this.stream.as_mut() {
+            Some(s) => s,
+            None => return Poll::Ready(None), // stream already returned/closed
+        };
+
+        let mut buf = [0u8; 16384];
+        let pin_stream = Pin::new(stream);
+        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+        match pin_stream.poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                if n == 0 {
+                    // EOF — stream closed
+                    // For ReadUntilClose this is normal end-of-body.
+                    // For ContentLength with remaining > 0, backend closed early.
+                    this.stream = None;
+                    this.pool = None;
+                    return Poll::Ready(None);
+                }
+
+                let chunk = match this.framing {
+                    BodyFraming::ContentLength { ref mut remaining } => {
+                        let take = (*remaining as usize).min(n);
+                        *remaining -= take as u64;
+                        Bytes::copy_from_slice(&buf[..take])
+                    }
+                    BodyFraming::ReadUntilClose => Bytes::copy_from_slice(&buf[..n]),
+                };
+
+                if let BodyFraming::ContentLength { remaining: 0 } = this.framing {
+                    this.maybe_return_to_pool();
+                }
+
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            Poll::Ready(Err(e)) => {
+                this.stream = None;
+                this.pool = None;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -194,13 +335,9 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
             let _ = stream.set_nodelay(true);
             let io = hyper_util::rt::TokioIo::new(stream);
 
-            // Pre-format peer IP once per connection (avoid per-request allocation).
-            let peer_ip = peer_addr.ip().to_string();
-
             let service = hyper::service::service_fn(move |req| {
                 let state = state.clone();
-                let peer_ip = peer_ip.clone();
-                async move { handle_proxy_request(req, state, peer_ip).await }
+                async move { handle_proxy_request(req, state, peer_addr).await }
             });
 
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -229,16 +366,15 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn handle_proxy_request(
-    mut req: Request<Incoming>,
+    req: Request<Incoming>,
     state: Arc<AppState>,
-    peer_ip: String,
+    peer_addr: SocketAddr,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let req_start = std::time::Instant::now();
-    state
-        .diag
-        .requests_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    state.diag.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Extract what we need for routing/metrics before potentially moving `req`.
     let host = req
         .headers()
         .get(header::HOST)
@@ -249,22 +385,23 @@ async fn handle_proxy_request(
     let method = req.method().clone();
 
     // ---- 1. Route lookup (lock-free ArcSwap read) ----
-    let route = match state.routing_table.route(&host, &path, req.headers()) {
-        Some(r) => r,
-        None => {
-            state
-                .diag
-                .requests_no_route
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            state
-                .metrics
-                .record_request(method.as_str(), &path, 404, &host);
-            return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
+    let route = {
+        let _span = tracing::trace_span!("route_lookup").entered();
+        match state.routing_table.route(&host, &path, req.headers()) {
+            Some(r) => r,
+            None => {
+                state.diag.requests_no_route.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                state.metrics.record_request(method.as_str(), &path, 404, &host);
+                return Ok(response(StatusCode::NOT_FOUND, "Not Found", None));
+            }
         }
     };
 
     // ---- 2. Increment in-flight counter (atomic) ----
-    let guard = state.queue.increase(&route.queue_key);
+    let guard = {
+        let _span = tracing::trace_span!("queue_increase").entered();
+        state.queue.increase(&route.queue_key)
+    };
 
     // ---- 3. Wait for ready endpoints (cold-start support) ----
     let wait_timeout = route
@@ -272,21 +409,22 @@ async fn handle_proxy_request(
         .or(route.failover_timeout)
         .unwrap_or(state.config.condition_wait_timeout);
 
+    // Use the pre-computed service_key from the routing table (avoids format! per request)
     let (target_url, is_cold_start) = {
+        let t0 = std::time::Instant::now();
         let result = state
             .endpoints_cache
-            .wait_for_ready(&route.target_namespace, &route.target_service, wait_timeout)
+            .wait_for_ready_by_key(&route.service_key, wait_timeout)
             .await;
+        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "wait_endpoints");
         match result {
-            Ok(cold_start) => (route.target_url.clone(), cold_start),
+            Ok(cold_start) => (route.target_url.as_str(), cold_start),
             Err(()) => {
                 // Timeout — try failover if configured
                 if let Some(ref failover_url) = route.failover_url {
-                    (failover_url.clone(), true)
+                    (failover_url.as_str(), true)
                 } else {
-                    state
-                        .metrics
-                        .record_request(method.as_str(), &path, 502, &host);
+                    state.metrics.record_request(method.as_str(), &path, 502, &host);
                     return Ok(response(
                         StatusCode::BAD_GATEWAY,
                         "Bad Gateway",
@@ -297,49 +435,16 @@ async fn handle_proxy_request(
         }
     };
 
-    // ---- 4. Build backend URI ----
-    let backend_uri = {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        match format!("{target_url}{path_and_query}").parse::<http::Uri>() {
-            Ok(uri) => uri,
-            Err(_) => {
-                state
-                    .metrics
-                    .record_request(method.as_str(), &path, 500, &host);
-                return Ok(response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                    Some(guard),
-                ));
-            }
-        }
-    };
-
-    *req.uri_mut() = backend_uri.clone();
-
-    // ---- 5. Add X-Forwarded-* headers ----
-    add_forwarded_headers(&mut req, &host, &peer_ip);
-
-    // ---- 6. Cold-start connectivity probe ----
-    // After a cold start, kube-proxy may not have updated its iptables/IPVS
-    // rules yet, even though the EndpointSlice already reports the pod as
-    // ready.  Probe TCP connectivity first so we don't waste the original
-    // request body on a guaranteed-to-fail connection.
     if is_cold_start {
-        state
-            .diag
-            .requests_cold_start
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let probe_start = std::time::Instant::now();
-        let authority = backend_uri
-            .authority()
-            .map(|a| a.as_str().to_string())
-            .unwrap_or_else(|| format!("{}:{}", route.target_service, route.target_port));
+        state.diag.requests_cold_start.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
+    // ---- 4. Compute authority (host:port for the backend) ----
+    let authority = &route.authority;
+
+    // ---- 5. Cold-start connectivity probe ----
+    if is_cold_start {
+        let probe_start = std::time::Instant::now();
         let probe_timeout = Duration::from_secs(5);
         let probe_deadline = tokio::time::Instant::now() + probe_timeout;
         let mut attempt = 0u32;
@@ -347,12 +452,11 @@ async fn handle_proxy_request(
         loop {
             match tokio::time::timeout(
                 Duration::from_secs(1),
-                tokio::net::TcpStream::connect(&authority),
+                tokio::net::TcpStream::connect(authority.as_str()),
             )
             .await
             {
                 Ok(Ok(_stream)) => {
-                    // Connection succeeded — kube-proxy routing is in place.
                     tracing::info!(
                         host = %host,
                         authority = %authority,
@@ -380,7 +484,6 @@ async fn handle_proxy_request(
                         ));
                     }
                     attempt += 1;
-                    // Backoff: 100ms, 200ms, 400ms, 800ms, ...
                     let delay = Duration::from_millis(100 << attempt.min(4));
                     tracing::debug!(
                         host = %host,
@@ -391,7 +494,6 @@ async fn handle_proxy_request(
                     tokio::time::sleep(delay).await;
                 }
                 Err(_) => {
-                    // TCP connect timed out (1s per attempt)
                     if tokio::time::Instant::now() >= probe_deadline {
                         tracing::error!(
                             host = %host,
@@ -413,35 +515,53 @@ async fn handle_proxy_request(
         }
     }
 
-    // ---- 7. Forward to backend ----
+    // ---- 6. Forward to backend (raw TCP) ----
     let resp_timeout = route
         .response_header_timeout
         .unwrap_or(state.config.response_header_timeout);
 
-    let result =
-        tokio::time::timeout(resp_timeout, state.http_client.request(req)).await;
+    let result = {
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            resp_timeout,
+            forward_raw(&state, authority, target_url, req, peer_addr),
+        )
+        .await;
+        tracing::trace!(elapsed_us = t0.elapsed().as_micros() as u64, "forward_request");
+        r
+    };
 
     match result {
-        Ok(Ok(resp)) => {
-            let status = resp.status();
+        Ok(Ok((status_code, resp_headers, body))) => {
+            let _span = tracing::trace_span!("record_metrics").entered();
             state
                 .metrics
-                .record_request(method.as_str(), &path, status.as_u16(), &host);
+                .record_request(method.as_str(), &path, status_code, &host);
+            drop(_span);
 
-            let (mut parts, body) = resp.into_parts();
-            if is_cold_start {
-                parts.headers.insert(
-                    "x-keda-http-cold-start",
-                    http::HeaderValue::from_static("true"),
-                );
+            let mut builder = Response::builder().status(status_code);
+            if let Some(h) = builder.headers_mut() {
+                *h = resp_headers;
+                if is_cold_start {
+                    h.insert(
+                        "x-keda-http-cold-start",
+                        http::HeaderValue::from_static("true"),
+                    );
+                }
             }
-            Ok(Response::from_parts(parts, ProxyBody::proxied(body, guard)))
+
+            tracing::trace!(
+                total_us = req_start.elapsed().as_micros() as u64,
+                status = status_code,
+                host = %host,
+                "request_complete",
+            );
+            Ok(builder
+                .body(ProxyBody::raw_stream(body, guard))
+                .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error", None)))
         }
         Ok(Err(e)) => {
-            state
-                .diag
-                .requests_backend_error
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.diag.requests_backend_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 error = %e,
                 host = %host,
@@ -458,10 +578,7 @@ async fn handle_proxy_request(
             ))
         }
         Err(_elapsed) => {
-            state
-                .diag
-                .requests_backend_error
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.diag.requests_backend_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 host = %host,
                 timeout = ?resp_timeout,
@@ -481,6 +598,182 @@ async fn handle_proxy_request(
 }
 
 // ---------------------------------------------------------------------------
+// Raw TCP forwarding
+// ---------------------------------------------------------------------------
+
+/// Forward a request to the backend over a raw TCP connection and return
+/// the parsed status code, response headers, and a streaming body.
+async fn forward_raw(
+    state: &Arc<AppState>,
+    authority: &str,
+    _target_url: &str,
+    req: Request<Incoming>,
+    peer_addr: SocketAddr,
+) -> std::io::Result<(u16, http::HeaderMap, RawResponseBody)> {
+    let (parts, body) = req.into_parts();
+
+    // 1. Get a pooled (or new) TCP connection
+    let mut stream = state.backend_pool.checkout(authority).await?;
+
+    // 2. Write request line + headers as raw bytes
+    let mut head_buf = Vec::with_capacity(1024);
+
+    // Request line: METHOD /path HTTP/1.1\r\n
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    write!(head_buf, "{} {} HTTP/1.1\r\n", parts.method, path_and_query)?;
+
+    // Host header (use the backend authority, not the original host)
+    write!(head_buf, "host: {}\r\n", authority)?;
+
+    // Original headers (skip hop-by-hop and Host — we set our own)
+    let host_orig = parts.headers.get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    for (name, value) in &parts.headers {
+        // Skip headers we handle ourselves
+        if name == header::HOST
+            || name == header::TRANSFER_ENCODING
+            || name == "x-forwarded-for"
+            || name == "x-forwarded-host"
+            || name == "x-forwarded-proto"
+        {
+            continue;
+        }
+        head_buf.extend_from_slice(name.as_str().as_bytes());
+        head_buf.extend_from_slice(b": ");
+        head_buf.extend_from_slice(value.as_bytes());
+        head_buf.extend_from_slice(b"\r\n");
+    }
+
+    // X-Forwarded-* headers (written directly, no String formatting)
+    head_buf.extend_from_slice(b"x-forwarded-for: ");
+    write!(head_buf, "{}", peer_addr.ip())?;
+    head_buf.extend_from_slice(b"\r\n");
+
+    head_buf.extend_from_slice(b"x-forwarded-host: ");
+    head_buf.extend_from_slice(host_orig.as_bytes());
+    head_buf.extend_from_slice(b"\r\n");
+
+    head_buf.extend_from_slice(b"x-forwarded-proto: http\r\n");
+
+    // End of headers
+    head_buf.extend_from_slice(b"\r\n");
+
+    // Write the entire header block in one syscall
+    stream.write_all(&head_buf).await?;
+
+    // 3. Forward request body (if any)
+    //    Consume the hyper Incoming body and write each chunk to the backend.
+    use hyper::body::Body as _;
+    if !body.is_end_stream() {
+        use http_body_util::BodyExt;
+        let mut body = body;
+        while let Some(frame_result) = body.frame().await {
+            match frame_result {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        stream.write_all(&data).await?;
+                    }
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("error reading request body: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Flush to ensure the request is sent.
+    stream.flush().await?;
+
+    // 4. Read response headers
+    let mut read_buf = BytesMut::with_capacity(8192);
+    let (status_code, headers, body_start) = read_response_head(&mut stream, &mut read_buf).await?;
+
+    // 5. Determine body framing
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let framing = if let Some(len) = content_length {
+        BodyFraming::ContentLength { remaining: len }
+    } else {
+        BodyFraming::ReadUntilClose
+    };
+
+    // 6. Create streaming body (any leftover bytes from header read are buffered)
+    let body = RawResponseBody::new(
+        stream,
+        body_start,
+        framing,
+        state.backend_pool.clone(),
+        authority.to_string(),
+    );
+
+    Ok((status_code, headers, body))
+}
+
+/// Read and parse the HTTP response status line + headers from the backend.
+/// Returns (status_code, headers, leftover_bytes_after_headers).
+async fn read_response_head(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+) -> std::io::Result<(u16, http::HeaderMap, BytesMut)> {
+    loop {
+        // Try to parse what we have so far
+        let mut headers_buf = [httparse::EMPTY_HEADER; 64];
+        let mut parsed = httparse::Response::new(&mut headers_buf);
+
+        match parsed.parse(buf) {
+            Ok(httparse::Status::Complete(header_len)) => {
+                let status = parsed.code.unwrap_or(502);
+
+                // Build HeaderMap from parsed headers
+                let mut header_map = http::HeaderMap::with_capacity(parsed.headers.len());
+                for h in parsed.headers.iter() {
+                    if let (Ok(name), Ok(value)) = (
+                        http::header::HeaderName::from_bytes(h.name.as_bytes()),
+                        http::HeaderValue::from_bytes(h.value),
+                    ) {
+                        header_map.append(name, value);
+                    }
+                }
+
+                // Split off the body portion (everything after the headers)
+                let body_start = buf.split_off(header_len);
+                // Drop the header portion
+                buf.clear();
+
+                return Ok((status, header_map, body_start));
+            }
+            Ok(httparse::Status::Partial) => {
+                // Need more data — read from the stream
+                let n = stream.read_buf(buf).await?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "backend closed connection before sending response headers",
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid HTTP response from backend: {e}"),
+                ));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -493,33 +786,4 @@ fn response(
         .status(status)
         .body(ProxyBody::fixed(body, guard))
         .expect("static response")
-}
-
-fn add_forwarded_headers(req: &mut Request<Incoming>, host: &str, peer_ip: &str) {
-    let headers = req.headers_mut();
-
-    // X-Forwarded-For: append client IP (avoid format! when possible)
-    if let Some(existing) = headers.get("x-forwarded-for") {
-        let existing_bytes = existing.as_bytes();
-        let mut buf = Vec::with_capacity(existing_bytes.len() + 2 + peer_ip.len());
-        buf.extend_from_slice(existing_bytes);
-        buf.extend_from_slice(b", ");
-        buf.extend_from_slice(peer_ip.as_bytes());
-        if let Ok(val) = http::HeaderValue::from_bytes(&buf) {
-            headers.insert("x-forwarded-for", val);
-        }
-    } else if let Ok(val) = http::HeaderValue::from_str(peer_ip) {
-        headers.insert("x-forwarded-for", val);
-    }
-
-    // X-Forwarded-Host
-    if let Ok(val) = http::HeaderValue::from_str(host) {
-        headers.insert("x-forwarded-host", val);
-    }
-
-    // X-Forwarded-Proto
-    headers.insert(
-        "x-forwarded-proto",
-        http::HeaderValue::from_static("http"),
-    );
 }

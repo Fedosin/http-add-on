@@ -33,17 +33,17 @@ impl EndpointsCache {
 
     /// Fast hot-path check: does the service have at least one ready endpoint?
     #[inline]
+    #[allow(dead_code)]
     pub fn has_ready_endpoints(&self, namespace: &str, service: &str) -> bool {
         let key = service_key(namespace, service);
-        self.ready_counts
-            .get(&key)
-            .is_some_and(|count| *count > 0)
+        self.has_ready_endpoints_by_key(&key)
     }
 
     /// Wait until the service has at least one ready endpoint, or `timeout`
     /// elapses.  Returns `Ok(false)` for warm backends (already ready),
     /// `Ok(true)` when a cold-start was detected but the backend is now ready,
     /// and `Err(())` on timeout.
+    #[allow(dead_code)]
     pub async fn wait_for_ready(
         &self,
         namespace: &str,
@@ -51,22 +51,30 @@ impl EndpointsCache {
         timeout: Duration,
     ) -> Result<bool, ()> {
         let key = service_key(namespace, service);
+        self.wait_for_ready_by_key(&key, timeout).await
+    }
 
+    /// Like `wait_for_ready` but takes a pre-computed `"namespace/service"` key,
+    /// avoiding the per-request `format!` allocation.
+    pub async fn wait_for_ready_by_key(
+        &self,
+        key: &str,
+        timeout: Duration,
+    ) -> Result<bool, ()> {
         // ---- fast path (warm backend) ----
-        if self.has_ready_endpoints(namespace, service) {
+        if self.has_ready_endpoints_by_key(key) {
             return Ok(false);
         }
 
         let mut rx = self.notify_tx.subscribe();
 
         // Re-check after subscribing to close the race window.
-        if self.has_ready_endpoints(namespace, service) {
+        if self.has_ready_endpoints_by_key(key) {
             return Ok(true);
         }
 
         tracing::debug!(
-            namespace = namespace,
-            service = service,
+            key = key,
             "cold-start: waiting for ready endpoints",
         );
 
@@ -74,11 +82,10 @@ impl EndpointsCache {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Ok(ref changed)) if changed == &key => {
-                    if self.has_ready_endpoints(namespace, service) {
+                Ok(Ok(ref changed)) if changed == key => {
+                    if self.has_ready_endpoints_by_key(key) {
                         tracing::info!(
-                            namespace = namespace,
-                            service = service,
+                            key = key,
                             "cold-start: endpoints became ready",
                         );
                         return Ok(true); // cold-start resolved
@@ -86,19 +93,14 @@ impl EndpointsCache {
                 }
                 Ok(Ok(_)) => continue, // different service
                 Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                    // Receiver fell behind — some notifications were dropped.
-                    // Re-check the current state; the service may have become
-                    // ready while we were lagging.
                     tracing::debug!(
                         skipped = n,
-                        namespace = namespace,
-                        service = service,
+                        key = key,
                         "cold-start: broadcast receiver lagged, re-checking",
                     );
-                    if self.has_ready_endpoints(namespace, service) {
+                    if self.has_ready_endpoints_by_key(key) {
                         tracing::info!(
-                            namespace = namespace,
-                            service = service,
+                            key = key,
                             "cold-start: endpoints became ready (detected after lag)",
                         );
                         return Ok(true);
@@ -106,19 +108,15 @@ impl EndpointsCache {
                     continue;
                 }
                 Ok(Err(_)) => {
-                    // Channel closed — sender dropped (shutdown).
                     tracing::warn!(
-                        namespace = namespace,
-                        service = service,
+                        key = key,
                         "cold-start: broadcast channel closed",
                     );
                     return Err(());
                 }
                 Err(_) => {
-                    // Timeout — condition_wait_timeout elapsed.
                     tracing::warn!(
-                        namespace = namespace,
-                        service = service,
+                        key = key,
                         timeout_secs = timeout.as_secs(),
                         "cold-start: timed out waiting for ready endpoints",
                     );
@@ -126,6 +124,14 @@ impl EndpointsCache {
                 }
             }
         }
+    }
+
+    /// O(1) check using a pre-computed key (no allocation).
+    #[inline]
+    pub fn has_ready_endpoints_by_key(&self, key: &str) -> bool {
+        self.ready_counts
+            .get(key)
+            .is_some_and(|count| *count > 0)
     }
 
     /// Recount ready endpoints for the service that `changed_slice` belongs to,
