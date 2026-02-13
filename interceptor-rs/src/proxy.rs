@@ -200,7 +200,7 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
             let service = hyper::service::service_fn(move |req| {
                 let state = state.clone();
                 let peer_ip = peer_ip.clone();
-                async move { handle_proxy_request(req, state, peer_addr, peer_ip).await }
+                async move { handle_proxy_request(req, state, peer_ip).await }
             });
 
             if let Err(e) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -231,7 +231,6 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
 async fn handle_proxy_request(
     mut req: Request<Incoming>,
     state: Arc<AppState>,
-    peer_addr: SocketAddr,
     peer_ip: String,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let req_start = std::time::Instant::now();
