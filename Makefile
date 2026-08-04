@@ -101,6 +101,9 @@ build-interceptor:
 build-scaler:
 	go build -o bin/scaler ./scaler
 
+build-grpc-echo:
+	go build -o bin/grpc-echo ./test/images/grpc-echo
+
 build: build-operator build-interceptor build-scaler
 
 ##################################################
@@ -208,6 +211,32 @@ benchmark-test: ## Run benchmark tests (BENCH_THROUGHPUT_RATE=300, BENCH_P99_MAX
 
 benchmark-test-ci: ## Run benchmark tests (CI mode with retries)
 	BENCHMARK=true go tool gotestsum --rerun-fails=1 --format=github-actions --packages="./test/e2e/benchmark/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v
+
+##################################################
+# OpenShift CI e2e                               #
+##################################################
+
+e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on from CI-built images
+	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
+	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
+		--namespace keda --create-namespace \
+		--version $(KEDA_VERSION) --wait --timeout 5m)
+	oc kustomize config/default \
+		| sed "s|ko://github.com/kedacore/http-add-on/operator|$${IMAGE_HTTP_ADDON_OPERATOR}|" \
+		| sed "s|ko://github.com/kedacore/http-add-on/interceptor|$${IMAGE_HTTP_ADDON_INTERCEPTOR}|" \
+		| sed "s|ko://github.com/kedacore/http-add-on/scaler|$${IMAGE_HTTP_ADDON_SCALER}|" \
+		| oc apply -f -
+	oc rollout status deploy/keda-add-ons-http-operator -n keda --timeout=5m
+	oc rollout status deploy/keda-add-ons-http-interceptor -n keda --timeout=5m
+	oc rollout status deploy/keda-add-ons-http-scaler -n keda --timeout=5m
+
+# TODO(linkvt): run all profiles (tls, observability) once default is stable
+e2e-test-openshift: PROFILE = default
+e2e-test-openshift: e2e-test ## Run default-profile e2e tests against OpenShift
+
+e2e-test-openshift-clean: $(HELM) ## Tear down http-add-on + KEDA installed by e2e-test-openshift-setup
+	oc kustomize config/default | oc delete -f - --ignore-not-found || true
+	$(HELM) uninstall keda -n keda || true
 
 ##################################################
 # Code generation & manifests                    #

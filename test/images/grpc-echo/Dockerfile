@@ -1,0 +1,8 @@
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0 AS builder
+WORKDIR /build
+COPY . .
+RUN make build-grpc-echo
+
+FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
+COPY --from=builder /build/bin/grpc-echo /usr/bin/
+CMD ["/usr/bin/grpc-echo"]
