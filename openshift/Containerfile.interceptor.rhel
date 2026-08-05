@@ -1,0 +1,15 @@
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0 AS builder
+
+ARG BUILD_VERSION=main
+ARG GIT_COMMIT=HEAD
+
+WORKDIR /workspace
+COPY . .
+
+RUN CGO_ENABLED=0 go build -mod=vendor \
+    -ldflags "-X github.com/kedacore/http-add-on/pkg/build.version=${BUILD_VERSION} -X github.com/kedacore/http-add-on/pkg/build.gitCommit=${GIT_COMMIT}" \
+    -o bin/interceptor ./interceptor
+
+FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
+COPY --from=builder /workspace/bin/interceptor /usr/bin/
+ENTRYPOINT ["/usr/bin/interceptor"]
