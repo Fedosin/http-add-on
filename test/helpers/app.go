@@ -162,10 +162,10 @@ func (a *TestApp) Resources() []k8s.Object {
 						LivenessProbe:  a.probe(5, probeScheme),
 						ReadinessProbe: a.probe(1, probeScheme),
 						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: new(false),
+							AllowPrivilegeEscalation: ptr.To(false),
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-							RunAsNonRoot:             new(true),
-							RunAsUser:                new(int64(65532)),
+							RunAsNonRoot:             ptr.To(true),
+							RunAsUser:                ptr.To(int64(65532)),
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
