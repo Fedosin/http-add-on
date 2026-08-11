@@ -82,7 +82,6 @@ func registerInterceptorProxy(testenv env.Environment, interceptorPort int) {
 						AllowPrivilegeEscalation: ptr.To(false),
 						Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 						RunAsNonRoot:             ptr.To(true),
-						RunAsUser:                ptr.To(int64(65532)),
 						SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 				}},

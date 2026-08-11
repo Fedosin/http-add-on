@@ -214,11 +214,7 @@ benchmark-test-ci: ## Run benchmark tests (CI mode with retries)
 # OpenShift CI e2e                               #
 ##################################################
 
-e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on from CI-built images
-	$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
-	$(call helm-retry,$(HELM) upgrade --install keda kedacore/keda \
-		--namespace keda --create-namespace \
-		--version $(KEDA_VERSION) --wait --timeout 5m)
+e2e-test-openshift-setup: e2e-deps ## Deploy http-add-on from CI-built images
 	oc kustomize config/default \
 		| sed "s|ko://github.com/kedacore/http-add-on/operator|$${IMAGE_HTTP_ADDON_OPERATOR}|" \
 		| sed "s|ko://github.com/kedacore/http-add-on/interceptor|$${IMAGE_HTTP_ADDON_INTERCEPTOR}|" \
@@ -228,9 +224,10 @@ e2e-test-openshift-setup: $(HELM) ## Install KEDA via Helm + deploy http-add-on 
 	oc rollout status deploy/keda-add-ons-http-interceptor -n keda --timeout=5m
 	oc rollout status deploy/keda-add-ons-http-scaler -n keda --timeout=5m
 
-# TODO(linkvt): run all profiles (tls, observability) once default is stable
-e2e-test-openshift: PROFILE = default
-e2e-test-openshift: e2e-test ## Run default-profile e2e tests against OpenShift
+e2e-test-openshift-ci: ## Run all e2e tests against OpenShift (CI mode with retries)
+# -p 1 is needed to run only one profile in parallel
+# -parallel 4 limits concurrent tests to avoid overwhelming the kubelet port-forward
+	go tool gotestsum --rerun-fails=2 --format=standard-verbose $(if $(ARTIFACT_DIR),--junitfile $(ARTIFACT_DIR)/junit.xml) --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
 
 e2e-test-openshift-clean: $(HELM) ## Tear down http-add-on + KEDA installed by e2e-test-openshift-setup
 	oc kustomize config/default | oc delete -f - --ignore-not-found || true

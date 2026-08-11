@@ -5,4 +5,4 @@ RUN make build-grpc-echo
 
 FROM registry.ci.openshift.org/ocp/5.0:base-rhel9
 COPY --from=builder /build/bin/grpc-echo /usr/bin/
-CMD ["/usr/bin/grpc-echo"]
+ENTRYPOINT ["/usr/bin/grpc-echo"]
