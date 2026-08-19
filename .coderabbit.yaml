@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Docs: https://docs.coderabbit.ai/getting-started/configure-coderabbit
+
+language: en-US
+early_access: false
+
+reviews:
+  profile: "chill"
+  high_level_summary: false
+  poem: false
+  request_changes_workflow: false
+  collapse_walkthrough: true
+
+  path_filters:
+    - "!**/vendor/**"
+    - "!**/zz_generated*"
+    - "!go.sum"
+    - "!vendor/**"
+    # Upstream-only files not used in our CI
+    - "!.github/**"
+    - "!.pre-commit-config.yaml"
+    - "!lychee.toml"
+
+  path_instructions:
+    - path: "operator/controllers/**/*.go"
+      instructions: |
+        Review for idempotent reconciliation, proper error handling and
+        status subresource updates. The operator manages the InterceptorRoute
+        CRD — verify that changes handle resource lifecycle correctly and
+        clean up on deletion.
+
+    - path: "operator/apis/**/*.go"
+      instructions: |
+        Review CRD API types for backward compatibility, correct
+        kubebuilder validation markers, proper JSON tags with omitempty
+        on optional fields, and deepcopy compliance. API changes require
+        regenerating CRDs and deepcopy (make generate).
+
+    - path: "interceptor/**/*.go"
+      instructions: |
+        The interceptor is an HTTP reverse proxy that tracks pending
+        request counts. Review for thread safety in queue tracking,
+        correct proxy behavior, proper error handling on upstream
+        failures, and resource cleanup. Changes here affect both
+        request routing and scaling accuracy.
+
+    - path: "scaler/**/*.go"
+      instructions: |
+        The scaler implements the KEDA external scaler gRPC protocol.
+        Review for correct metric aggregation from interceptor instances,
+        proper gRPC error handling, and thread safety.
+
+    - path: "pkg/**/*.go"
+      instructions: |
+        Shared libraries used by all three binaries (operator,
+        interceptor, scaler). Changes here have wide blast radius.
+        Review for correctness and thread safety.
+
+    - path: "test/**/*.go"
+      instructions: |
+        Review e2e tests for deterministic test names, proper resource
+        cleanup, and realistic timeouts. Tests should use Go standard
+        library testing, not testify/gomega/ginkgo.
+
+    - path: "config/**/*.yaml"
+      instructions: |
+        CRD manifests in config/crd/bases/ are generated — do not
+        approve hand-edits to these files. For other manifests, check
+        securityContext, resource limits, and RBAC least privilege.
+
+    - path: "openshift/**"
+      instructions: |
+        These are downstream-only OpenShift container image definitions.
+        Check for correct base images, no secrets or credentials,
+        and minimal image size.
+
+    - path: "hack/**"
+      instructions: |
+        These scripts run in CI. Check for correct error handling
+        (set -e), shellcheck compliance, and that the script matches
+        what CI expects.
+
+  tools:
+    gitleaks:
+      enabled: true
+    golangci-lint:
+      enabled: true
+    hadolint:
+      enabled: true
+
+  knowledge_base:
+    code_guidelines:
+      enabled: true
+      filePatterns:
+        - "**/AGENTS.md"
+        - "**/CONTRIBUTING_OPENSHIFT.md"
+    learnings:
+      scope: auto
+    issues:
+      scope: auto
+    pull_requests:
+      scope: auto
