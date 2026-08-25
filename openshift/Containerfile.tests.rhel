@@ -1,0 +1,15 @@
+# This image packages the e2e test suite so it can be run from a foreign CI
+# job like in the custom-metrics-autoscaler-operator CI.
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-5.0
+
+COPY . /src
+WORKDIR /src
+RUN chmod 777 -R /src
+
+ENV HOME=/src
+ENV GOPATH=/src/.gopath
+ENV GOCACHE=/src/.cache
+
+# the base image defaults to -mod=vendor, which blocks network-dependent
+# commands like installing helm via 'go install foo@version'
+ENV GOFLAGS=
