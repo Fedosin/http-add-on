@@ -175,6 +175,8 @@ e2e-test-images: ## Build all test images under test/images/ and push to $KO_DOC
 
 e2e-deps-external: e2e-deps-cert-manager e2e-deps-jaeger e2e-deps-otel-collector ## Install non-KEDA e2e deps
 
+e2e-deps: e2e-deps-external e2e-deps-keda ## Install all e2e dependencies
+
 e2e-deps-cert-manager: $(HELM)
 	$(HELM) repo add jetstack https://charts.jetstack.io --force-update
 	$(call helm-retry,$(HELM) upgrade --install cert-manager jetstack/cert-manager \
