@@ -2,6 +2,7 @@
 # Variables                                      #
 ##################################################
 SHELL          = /bin/bash
+.SHELLFLAGS    = -eo pipefail -c # fail on error and pipeline failures
 .DEFAULT_GOAL := ko-build
 
 IMAGE_REGISTRY ?= ghcr.io
@@ -28,13 +29,13 @@ IMAGE_SCALER_SHA_TAG       ?= $(IMAGE_SCALER):$(GIT_COMMIT_SHORT)
 KO_RELEASE_PLATFORMS ?= linux/amd64,linux/arm64,linux/s390x
 
 # renovate: datasource=helm depName=cert-manager registryUrl=https://charts.jetstack.io
-CERT_MANAGER_VERSION ?= v1.20.2
+CERT_MANAGER_VERSION ?= v1.21.2
 # renovate: datasource=helm depName=jaeger registryUrl=https://jaegertracing.github.io/helm-charts
-JAEGER_VERSION ?= 4.11.0
+JAEGER_VERSION ?= 4.13.1
 # renovate: datasource=helm depName=keda registryUrl=https://kedacore.github.io/charts
-KEDA_VERSION ?= 2.20.0
+KEDA_VERSION ?= 2.20.2
 # renovate: datasource=helm depName=opentelemetry-collector registryUrl=https://open-telemetry.github.io/opentelemetry-helm-charts
-OTEL_COLLECTOR_VERSION ?= 0.158.1
+OTEL_COLLECTOR_VERSION ?= 0.173.1
 
 HELM_RETRIES ?= 3
 HELM_RETRY_DELAY ?= 30
@@ -57,33 +58,15 @@ CONTROLLER_GEN ?= go tool controller-gen
 LOCALBIN ?= $(CURDIR)/bin
 
 # renovate: datasource=github-releases depName=golangci/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.13.2
+# renovate: datasource=github-releases depName=kubernetes-sigs/kustomize extractVersion=^kustomize\/(?<version>.+)$$
+KUSTOMIZE_VERSION ?= v5.8.1
 # renovate: datasource=github-releases depName=helm/helm
-HELM_VERSION ?= v4.2.3
+HELM_VERSION ?= v4.3.0
 
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+KUSTOMIZE     ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)
 HELM          ?= $(LOCALBIN)/helm-$(HELM_VERSION)
-
-# TODO(v1): remove DOMAINS, ABC_DOMAINS, and the cert targets below when removing the legacy e2e tests.
-define DOMAINS
-basicConstraints=CA:FALSE
-keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = localhost
-DNS.2 = *.keda
-DNS.3 = *.interceptor-tls-test-ns
-endef
-export DOMAINS
-
-define ABC_DOMAINS
-basicConstraints=CA:FALSE
-keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = abc
-endef
-export ABC_DOMAINS
 
 ##################################################
 # Go build                                       #
@@ -97,9 +80,6 @@ build-interceptor:
 
 build-scaler:
 	go build -o bin/scaler ./scaler
-
-build-grpc-echo:
-	go build -o bin/grpc-echo ./test/images/grpc-echo
 
 build: build-operator build-interceptor build-scaler
 
@@ -122,23 +102,6 @@ ko-build: ko-build-operator ko-build-interceptor ko-build-scaler
 # Testing                                        #
 ##################################################
 
-# TODO(v1): remove cert targets below when removing the legacy e2e tests.
-rootca-test-certs:
-	mkdir -p certs
-	openssl req -x509 -nodes -new -sha256 -days 1024 -newkey rsa:2048 -keyout certs/RootCA.key -out certs/RootCA.pem -subj "/C=US/CN=Keda-Root-CA"
-	openssl x509 -outform pem -in certs/RootCA.pem -out certs/RootCA.crt
-
-test-certs: rootca-test-certs
-	echo "$$DOMAINS" > certs/domains.ext
-	openssl req -new -nodes -newkey rsa:2048 -keyout certs/tls.key -out certs/tls.csr -subj "/C=US/ST=KedaState/L=KedaCity/O=Keda-Certificates/CN=keda.local"
-	openssl x509 -req -sha256 -days 1024 -in certs/tls.csr -CA certs/RootCA.pem -CAkey certs/RootCA.key -CAcreateserial -extfile certs/domains.ext -out certs/tls.crt
-	echo "$$ABC_DOMAINS" > certs/abc_domains.ext
-	openssl req -new -nodes -newkey rsa:2048 -keyout certs/abc.tls.key -out certs/abc.tls.csr -subj "/C=US/ST=KedaState/L=KedaCity/O=Keda-Certificates/CN=abc"
-	openssl x509 -req -sha256 -days 1024 -in certs/abc.tls.csr -CA certs/RootCA.pem -CAkey certs/RootCA.key -CAcreateserial -extfile certs/abc_domains.ext -out certs/abc.tls.crt
-
-clean-test-certs:
-	rm -rf certs
-
 .PHONY: test
 test:
 	go test ./...
@@ -146,9 +109,9 @@ test:
 FUZZ_TIME ?= 30s
 FUZZ_TARGETS = \
 	FuzzTableMemoryRoute:./pkg/routing/ \
-	FuzzParseTLSVersion:./interceptor/ \
-	FuzzParseCipherSuites:./interceptor/ \
-	FuzzParseCurvePreferences:./interceptor/ \
+	FuzzParseTLSVersion:./pkg/tls/ \
+	FuzzParseCipherSuites:./pkg/tls/ \
+	FuzzParseCurvePreferences:./pkg/tls/ \
 	FuzzProxyHandler:./interceptor/ \
 	FuzzEscapeString:./scaler/
 
@@ -181,7 +144,7 @@ e2e-test-default: e2e-test
 e2e-test-ci: ## Run all e2e tests (CI mode with retries)
 # -p 1 is needed to run only one profile (=addon configuration) in parallel
 # -parallel 4 limits concurrent tests to avoid overwhelming the kubelet port-forward
-	gotestsum --rerun-fails=2 --format=github-actions --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
+	go tool gotestsum --rerun-fails=2 --format=github-actions --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
 
 e2e-test-images: ## Build all test images under test/images/ and push to $KO_DOCKER_REPO
 	# --base-import-paths prevents the hash suffix in image names
@@ -220,28 +183,11 @@ e2e-deps-otel-collector: $(HELM)
 
 e2e-setup: e2e-deps deploy e2e-test-images ## Full e2e setup: install deps + deploy http-add-on + build test images
 
-##################################################
-# OpenShift CI e2e                               #
-##################################################
+benchmark-test: ## Run benchmark tests (BENCH_THROUGHPUT_RATE=300, BENCH_P99_MAX=2s, ...)
+	BENCHMARK=true go test -tags e2e ./test/e2e/benchmark/... -p 1 -count=1 -timeout 30m -v $(if $(RUN),-run '$(RUN)')
 
-e2e-test-openshift-setup: e2e-deps ## Deploy http-add-on from CI-built images
-	oc kustomize config/default \
-		| sed "s|ko://github.com/kedacore/http-add-on/operator|$${IMAGE_HTTP_ADDON_OPERATOR}|" \
-		| sed "s|ko://github.com/kedacore/http-add-on/interceptor|$${IMAGE_HTTP_ADDON_INTERCEPTOR}|" \
-		| sed "s|ko://github.com/kedacore/http-add-on/scaler|$${IMAGE_HTTP_ADDON_SCALER}|" \
-		| oc apply -f -
-	oc rollout status deploy/keda-add-ons-http-operator -n keda --timeout=5m
-	oc rollout status deploy/keda-add-ons-http-interceptor -n keda --timeout=5m
-	oc rollout status deploy/keda-add-ons-http-scaler -n keda --timeout=5m
-
-e2e-test-openshift-ci: ## Run all e2e tests against OpenShift (CI mode with retries)
-# -p 1 is needed to run only one profile in parallel
-# -parallel 4 limits concurrent tests to avoid overwhelming the kubelet port-forward
-	go tool gotestsum --rerun-fails=2 --format=standard-verbose $(if $(ARTIFACT_DIR),--junitfile $(ARTIFACT_DIR)/junit.xml) --packages="./test/e2e/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v -parallel 4
-
-e2e-test-openshift-clean: $(HELM) ## Tear down http-add-on + KEDA installed by e2e-test-openshift-setup
-	oc kustomize config/default | oc delete -f - --ignore-not-found || true
-	$(HELM) uninstall keda -n keda || true
+benchmark-test-ci: ## Run benchmark tests (CI mode with retries)
+	BENCHMARK=true go tool gotestsum --rerun-fails=1 --format=github-actions --packages="./test/e2e/benchmark/..." -- -tags e2e -p 1 -count=1 -timeout 30m -v
 
 ##################################################
 # Code generation & manifests                    #
@@ -286,26 +232,23 @@ pre-commit: ## Run static-checks.
 # Deployment (local cluster)                     #
 ##################################################
 
-install:
-	kustomize build config/crd | kubectl apply -f -
+install: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/crd | kubectl apply -f -
 
-deploy:
-	kustomize build config/default | ko apply -f -
+deploy: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/default | ko apply -f -
 
-deploy-e2e:
-	kustomize build config/e2e | ko apply -f -
+deploy-operator: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/operator | ko apply -f -
 
-deploy-operator:
-	kustomize build config/operator | ko apply -f -
+deploy-interceptor: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/interceptor | ko apply -f -
 
-deploy-interceptor:
-	kustomize build config/interceptor | ko apply -f -
+deploy-scaler: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/scaler | ko apply -f -
 
-deploy-scaler:
-	kustomize build config/scaler | ko apply -f -
-
-undeploy:
-	kustomize build config/default | ko delete -f - || true
+undeploy: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/default | ko delete -f - || true
 
 ##################################################
 # Publish, release & signing                     #
@@ -313,25 +256,25 @@ undeploy:
 
 publish-operator:
 	# --bare preserves image names like ghcr.io/kedacore/http-add-on-operator
-	KO_DOCKER_REPO=$(IMAGE_OPERATOR) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./operator
+	KO_DOCKER_REPO=$(IMAGE_OPERATOR) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./operator | tee operator.digest
 
 publish-interceptor:
-	KO_DOCKER_REPO=$(IMAGE_INTERCEPTOR) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./interceptor
+	KO_DOCKER_REPO=$(IMAGE_INTERCEPTOR) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./interceptor | tee interceptor.digest
 
 publish-scaler:
-	KO_DOCKER_REPO=$(IMAGE_SCALER) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./scaler
+	KO_DOCKER_REPO=$(IMAGE_SCALER) ko build --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION),$(GIT_COMMIT_SHORT) ./scaler | tee scaler.digest
 
 publish: publish-operator publish-interceptor publish-scaler
 
-release: manifests ## Produce new KEDA Http Add-on release in keda-add-ons-http-$(VERSION).yaml file.
-	kustomize build config/crd > keda-add-ons-http-$(VERSION).yaml
+release: manifests $(KUSTOMIZE) ## Produce new KEDA Http Add-on release in keda-add-ons-http-$(VERSION).yaml file.
+	$(KUSTOMIZE) build config/crd > keda-add-ons-http-$(VERSION).yaml
 	echo '---' >> keda-add-ons-http-$(VERSION).yaml
-	kustomize build config/operator | KO_DOCKER_REPO=$(IMAGE_OPERATOR) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
+	$(KUSTOMIZE) build config/operator | KO_DOCKER_REPO=$(IMAGE_OPERATOR) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
 	echo '---' >> keda-add-ons-http-$(VERSION).yaml
-	kustomize build config/interceptor | KO_DOCKER_REPO=$(IMAGE_INTERCEPTOR) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
+	$(KUSTOMIZE) build config/interceptor | KO_DOCKER_REPO=$(IMAGE_INTERCEPTOR) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
 	echo '---' >> keda-add-ons-http-$(VERSION).yaml
-	kustomize build config/scaler | KO_DOCKER_REPO=$(IMAGE_SCALER) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
-	kustomize build config/crd > keda-add-ons-http-$(VERSION)-crds.yaml
+	$(KUSTOMIZE) build config/scaler | KO_DOCKER_REPO=$(IMAGE_SCALER) ko resolve --bare --platform=$(KO_RELEASE_PLATFORMS) --tags=$(VERSION) -f - >> keda-add-ons-http-$(VERSION).yaml
+	$(KUSTOMIZE) build config/crd > keda-add-ons-http-$(VERSION)-crds.yaml
 
 sign-images: ## Sign KEDA images published on GitHub Container Registry
 	cosign sign $(COSIGN_FLAGS) $(IMAGE_OPERATOR_VERSIONED_TAG)
@@ -350,6 +293,9 @@ $(LOCALBIN):
 
 $(GOLANGCI_LINT): | $(LOCALBIN)
 	$(call go-install-tool,golangci-lint,github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+$(KUSTOMIZE): | $(LOCALBIN)
+	$(call go-install-tool,kustomize,sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
 
 $(HELM): | $(LOCALBIN)
 	$(call go-install-tool,helm,helm.sh/helm/v4/cmd/helm,$(HELM_VERSION))

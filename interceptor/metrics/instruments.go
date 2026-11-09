@@ -15,19 +15,35 @@ const (
 	meterName   = "keda-interceptor-proxy"
 	ServiceName = "keda-http-interceptor"
 
-	MetricRequestConcurrency = "interceptor.request.concurrency"
-	MetricRequestCount       = "interceptor.request.count"
-	MetricRequestDuration    = "interceptor.request.duration"
+	MetricRequestConcurrency  = "interceptor.request.concurrency"
+	MetricRequestCount        = "interceptor.request.count"
+	MetricRequestDuration     = "interceptor.request.duration"
+	MetricColdStartDuration   = "interceptor.cold_start.duration"
+	MetricColdStartRejections = "interceptor.cold_start.rejections"
 
 	AttrCode           = "code"
+	AttrColdStart      = "cold_start"
 	AttrMethod         = "method"
+	AttrOutcome        = "outcome"
 	AttrRouteName      = "route_name"
 	AttrRouteNamespace = "route_namespace"
+
+	ColdStartOutcomeReady     = "ready"
+	ColdStartOutcomeTimeout   = "timeout"
+	ColdStartOutcomeCancelled = "cancelled"
 
 	// MethodOther is the normalized value for non-standard HTTP methods,
 	// following the OTel semantic convention prefix for synthetic values.
 	MethodOther = "_OTHER"
 )
+
+// durationBucketBoundaries are the bucket boundaries (seconds) for duration histograms.
+// Below 10s: OTel HTTP semconv defaults, see https://opentelemetry.io/docs/specs/semconv/http/http-metrics/ .
+// Above 10s: extended to make longer cold-start durations visible.
+var durationBucketBoundaries = []float64{
+	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
+	15, 30, 60, 120, 300,
+}
 
 // standardMethods is the set of HTTP methods that pass through normalization.
 // Non-standard methods are mapped to MethodOther to bound cardinality.
@@ -45,9 +61,11 @@ var standardMethods = map[string]bool{
 
 // Instruments holds all metric instruments for the interceptor.
 type Instruments struct {
-	pendingRequests api.Int64UpDownCounter
-	requestCounter  api.Int64Counter
-	requestDuration api.Float64Histogram
+	pendingRequests     api.Int64UpDownCounter
+	requestCounter      api.Int64Counter
+	requestDuration     api.Float64Histogram
+	coldStartDuration   api.Float64Histogram
+	coldStartRejections api.Int64Counter
 }
 
 // NewNoopInstruments returns Instruments backed by a no-op provider, for use in tests.
@@ -75,13 +93,20 @@ func NewInstruments(provider *sdkmetric.MeterProvider) (*Instruments, error) {
 		MetricRequestDuration,
 		api.WithDescription("Time from request received to response written"),
 		api.WithUnit("s"),
-		// Bucket boundaries from OTel HTTP semconv: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
-		api.WithExplicitBucketBoundaries(
-			0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
-		),
+		api.WithExplicitBucketBoundaries(durationBucketBoundaries...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating request duration histogram: %w", err)
+	}
+
+	coldStartDuration, err := meter.Float64Histogram(
+		MetricColdStartDuration,
+		api.WithDescription("Time spent waiting for a cold-start backend to become ready"),
+		api.WithUnit("s"),
+		api.WithExplicitBucketBoundaries(durationBucketBoundaries...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating cold-start duration histogram: %w", err)
 	}
 
 	pendingRequests, err := meter.Int64UpDownCounter(
@@ -92,10 +117,20 @@ func NewInstruments(provider *sdkmetric.MeterProvider) (*Instruments, error) {
 		return nil, fmt.Errorf("creating pending requests counter: %w", err)
 	}
 
+	coldStartRejections, err := meter.Int64Counter(
+		MetricColdStartRejections,
+		api.WithDescription("Requests rejected because the cold-start pending request limit was reached"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating cold-start rejections counter: %w", err)
+	}
+
 	return &Instruments{
-		requestCounter:  requestCounter,
-		requestDuration: requestDuration,
-		pendingRequests: pendingRequests,
+		requestCounter:      requestCounter,
+		requestDuration:     requestDuration,
+		pendingRequests:     pendingRequests,
+		coldStartDuration:   coldStartDuration,
+		coldStartRejections: coldStartRejections,
 	}, nil
 }
 
@@ -107,15 +142,26 @@ func normalizeMethod(method string) string {
 }
 
 // RecordRequest records a completed request with bounded labels.
-func (i *Instruments) RecordRequest(method string, code int, routeName, routeNamespace string, duration time.Duration) {
+func (i *Instruments) RecordRequest(method string, code int, routeName, routeNamespace string, isColdStart bool, duration time.Duration) {
 	attrs := api.WithAttributeSet(attribute.NewSet(
 		attribute.Int(AttrCode, code),
+		attribute.Bool(AttrColdStart, isColdStart),
 		attribute.String(AttrMethod, normalizeMethod(method)),
 		attribute.String(AttrRouteName, routeName),
 		attribute.String(AttrRouteNamespace, routeNamespace),
 	))
 	i.requestCounter.Add(context.Background(), 1, attrs)
 	i.requestDuration.Record(context.Background(), duration.Seconds(), attrs)
+}
+
+// RecordColdStartDuration records the time spent waiting for backend readiness.
+func (i *Instruments) RecordColdStartDuration(routeName, routeNamespace, outcome string, duration time.Duration) {
+	attrs := api.WithAttributeSet(attribute.NewSet(
+		attribute.String(AttrOutcome, outcome),
+		attribute.String(AttrRouteName, routeName),
+		attribute.String(AttrRouteNamespace, routeNamespace),
+	))
+	i.coldStartDuration.Record(context.Background(), duration.Seconds(), attrs)
 }
 
 // RecordPendingRequest increments or decrements the pending request gauge.
@@ -125,4 +171,14 @@ func (i *Instruments) RecordPendingRequest(routeName, routeNamespace string, del
 		attribute.String(AttrRouteNamespace, routeNamespace),
 	))
 	i.pendingRequests.Add(context.Background(), delta, attrs)
+}
+
+// RecordColdStartRejection records a request rejected because the route's
+// cold-start pending request limit was reached.
+func (i *Instruments) RecordColdStartRejection(routeName, routeNamespace string) {
+	attrs := api.WithAttributeSet(attribute.NewSet(
+		attribute.String(AttrRouteName, routeName),
+		attribute.String(AttrRouteNamespace, routeNamespace),
+	))
+	i.coldStartRejections.Add(context.Background(), 1, attrs)
 }

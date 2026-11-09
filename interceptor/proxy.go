@@ -18,6 +18,7 @@ import (
 	kedanet "github.com/kedacore/http-add-on/pkg/net"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	"github.com/kedacore/http-add-on/pkg/routing"
+	"github.com/kedacore/http-add-on/pkg/util"
 )
 
 // ProxyHandlerConfig contains all dependencies for building the proxy handler chain.
@@ -29,7 +30,8 @@ type ProxyHandlerConfig struct {
 	Reader       client.Reader
 	Timeouts     config.Timeouts
 	Serving      config.Serving
-	TLSConfig    *tls.Config
+	ServingTLS   *tls.Config
+	OutboundTLS  *tls.Config
 	Tracing      config.Tracing
 	Instruments  *metrics.Instruments
 
@@ -50,45 +52,42 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 		}
 	}
 
-	var forwardingTLSCfg *tls.Config
-	if cfg.TLSConfig != nil {
-		forwardingTLSCfg = &tls.Config{
-			RootCAs:            cfg.TLSConfig.RootCAs,
-			Certificates:       cfg.TLSConfig.Certificates,
-			InsecureSkipVerify: cfg.TLSConfig.InsecureSkipVerify, //nolint:gosec // G402: user-configurable
-			MinVersion:         cfg.TLSConfig.MinVersion,
-			MaxVersion:         cfg.TLSConfig.MaxVersion,
-			CipherSuites:       cfg.TLSConfig.CipherSuites,
-			CurvePreferences:   cfg.TLSConfig.CurvePreferences,
-		}
-	}
-
 	// Clone DefaultTransport to inherit Go's defaults for IdleConnTimeout, ...
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	baseTransport.DialContext = dialFunc
 	baseTransport.MaxIdleConns = cfg.Timeouts.MaxIdleConns
 	baseTransport.MaxIdleConnsPerHost = cfg.Timeouts.MaxIdleConnsPerHost
-	baseTransport.TLSClientConfig = forwardingTLSCfg
+
+	// When TLS is enabled, use DialTLSContext to set ServerName per-dial from
+	// context. This is required for direct-pod routing where the URL host is a
+	// pod IP but SNI must remain the original service hostname.
+	if cfg.OutboundTLS != nil {
+		baseTransport.DialTLSContext = newTLSDialer(cfg.OutboundTLS, dialFunc)
+	}
 
 	// Build handler chain (innermost to outermost)
-	var h http.Handler
+	upstream := handler.NewUpstream(baseTransport, cfg.Reader, cfg.Tracing, cfg.Timeouts.ResponseHeader)
 
-	h = handler.NewUpstream(baseTransport, cfg.Reader, cfg.Tracing, cfg.Timeouts.ResponseHeader)
-
-	h = middleware.NewEndpointResolver(h, cfg.ReadyCache, middleware.EndpointResolverConfig{
+	var h http.Handler = middleware.NewEndpointResolver(upstream, cfg.ReadyCache, middleware.EndpointResolverConfig{
 		ReadinessTimeout:      cfg.Timeouts.Readiness,
 		EnableColdStartHeader: cfg.Serving.EnableColdStartHeader,
+		DirectPodRouting:      cfg.Serving.DirectPodRouting,
+		Instruments:           cfg.Instruments,
 	})
 
-	h = middleware.NewPlaceholder(h, cfg.ReadyCache, cfg.Reader)
+	h = middleware.NewColdStart(h, cfg.ReadyCache, cfg.Reader, cfg.Queue, cfg.Instruments, middleware.ColdStartConfig{
+		MaxPendingRequests: cfg.Serving.ColdStartMaxPendingRequests,
+	})
 
 	h = middleware.NewCounting(h, cfg.Queue, cfg.Instruments)
+
+	h = middleware.NewStaticRouting(h, upstream, cfg.ReadyCache, cfg.Reader)
 
 	h = middleware.NewRouting(
 		h,
 		cfg.RoutingTable,
 		cfg.Reader,
-		cfg.TLSConfig != nil,
+		cfg.ServingTLS != nil,
 		cfg.Timeouts.Request,
 	)
 
@@ -103,4 +102,31 @@ func BuildProxyHandler(cfg *ProxyHandlerConfig) http.Handler {
 	}
 
 	return h
+}
+
+// newTLSDialer dials TCP then wraps the conn in TLS, taking ServerName from
+// context (the original service hostname captured by routing middleware). When
+// direct-pod routing rewrites the URL to a pod IP, this ensures SNI stays the
+// service hostname. If the context has no server name (e.g. non-routing paths),
+// falls back to the hostname extracted from the dial address.
+func newTLSDialer(baseCfg *tls.Config, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg := baseCfg.Clone()
+		// Advertise h2 in ALPN explicitly: a custom DialTLSContext disables
+		// net/http's auto-h2, so without this HTTPS upstreams (incl. gRPC)
+		// downgrade to HTTP/1.1 (golang/go#20645).
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+		tlsCfg.ServerName = util.UpstreamServerNameFromContext(ctx)
+		if tlsCfg.ServerName == "" {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				tlsCfg.ServerName = host
+			}
+		}
+		return tls.Client(conn, tlsCfg), nil
+	}
 }

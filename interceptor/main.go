@@ -34,6 +34,7 @@ import (
 	"github.com/kedacore/http-add-on/pkg/observability"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	"github.com/kedacore/http-add-on/pkg/routing"
+	kedatls "github.com/kedacore/http-add-on/pkg/tls"
 	"github.com/kedacore/http-add-on/pkg/util"
 )
 
@@ -52,12 +53,8 @@ func main() {
 	}
 }
 
+//nolint:gocyclo // rather lengthy but not worth fixing right now
 func run() error {
-	timeoutCfg := config.MustParseTimeouts(setupLog)
-	servingCfg := config.MustParseServing()
-	metricsCfg := observability.MustParseMetricsConfig()
-	tracingCfg := observability.MustParseTracingConfig()
-
 	opts := zap.Options{
 		Development: true,
 	}
@@ -66,10 +63,17 @@ func run() error {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	timeoutCfg := config.MustParseTimeouts(setupLog)
+	servingCfg := config.MustParseServing()
+	tlsPolicyCfg := config.MustParseTLSPolicy(setupLog)
+	metricsCfg := observability.MustParseMetricsConfig()
+	tracingCfg := observability.MustParseTracingConfig()
+
 	setupLog.Info(
 		"starting interceptor",
 		"timeoutConfig", timeoutCfg,
 		"servingConfig", servingCfg,
+		"tlsPolicyConfig", tlsPolicyCfg,
 		"metricsConfig", metricsCfg,
 	)
 
@@ -234,26 +238,37 @@ func run() error {
 
 	// --- Proxy goroutines (use proxyCtx) ---
 
+	// TLS trust and verification settings for outbound connections to backends.
+	caPool, err := kedatls.BuildCAPool(tlsPolicyCfg.CADirs)
+	if err != nil {
+		return fmt.Errorf("building CA pool: %w", err)
+	}
+	outboundTLS, err := tlsPolicyCfg.NewConfig()
+	if err != nil {
+		return fmt.Errorf("outbound TLS policy: %w", err)
+	}
+	outboundTLS.RootCAs = caPool
+
 	// start the proxy servers. This is the server that
 	// accepts, holds and forwards user requests
 	if servingCfg.ProxyTLSEnabled {
 		proxyEg.Go(func() error {
-			tlsCfg, err := BuildTLSConfig(TLSOptions{
-				CertificatePath:    servingCfg.TLSCertPath,
-				KeyPath:            servingCfg.TLSKeyPath,
-				CertStorePaths:     servingCfg.TLSCertStorePaths,
-				InsecureSkipVerify: servingCfg.TLSSkipVerify,
-				MinTLSVersion:      servingCfg.TLSMinVersion,
-				MaxTLSVersion:      servingCfg.TLSMaxVersion,
-				CipherSuites:       servingCfg.TLSCipherSuites,
-				CurvePreferences:   servingCfg.TLSCurvePreferences,
-			}, setupLog)
+			servingTLS, watcher, err := BuildServingTLSConfig(ServingTLSOptions{
+				CertificatePath: servingCfg.TLSCertPath,
+				KeyPath:         servingCfg.TLSKeyPath,
+				CertStorePaths:  servingCfg.TLSCertStorePaths,
+			}, tlsPolicyCfg, setupLog)
 			if err != nil {
 				return fmt.Errorf("configuring TLS: %w", err)
 			}
+			if watcher != nil {
+				proxyEg.Go(func() error {
+					return watcher.Start(proxyCtx)
+				})
+			}
 
 			setupLog.Info("starting the proxy server with TLS enabled", "port", servingCfg.TLSPort)
-			if err := runProxyServer(proxyCtx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, servingCfg.TLSPort, tlsCfg, tracingCfg, instruments, &draining); !util.IsIgnoredErr(err) {
+			if err := runProxyServer(proxyCtx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, servingCfg.TLSPort, servingTLS, outboundTLS, tracingCfg, instruments, &draining); !util.IsIgnoredErr(err) {
 				return fmt.Errorf("tls proxy server: %w", err)
 			}
 			return nil
@@ -262,7 +277,7 @@ func run() error {
 
 	proxyEg.Go(func() error {
 		setupLog.Info("starting the proxy server", "port", servingCfg.ProxyPort)
-		if err := runProxyServer(proxyCtx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, servingCfg.ProxyPort, nil, tracingCfg, instruments, &draining); !util.IsIgnoredErr(err) {
+		if err := runProxyServer(proxyCtx, ctrl.Log, queues, readyCache, routingTable, ctrlCache, timeoutCfg, servingCfg, servingCfg.ProxyPort, nil, outboundTLS, tracingCfg, instruments, &draining); !util.IsIgnoredErr(err) {
 			return fmt.Errorf("proxy server: %w", err)
 		}
 		return nil
@@ -356,7 +371,8 @@ func runProxyServer(
 	timeouts config.Timeouts,
 	serving config.Serving,
 	port int,
-	tlsCfg *tls.Config,
+	servingTLS *tls.Config,
+	outboundTLS *tls.Config,
 	tracingConfig config.Tracing,
 	instruments *metrics.Instruments,
 	draining *atomic.Bool,
@@ -370,7 +386,8 @@ func runProxyServer(
 		Reader:       reader,
 		Timeouts:     timeouts,
 		Serving:      serving,
-		TLSConfig:    tlsCfg,
+		ServingTLS:   servingTLS,
+		OutboundTLS:  outboundTLS,
 		Tracing:      tracingConfig,
 		Instruments:  instruments,
 	})
@@ -380,7 +397,7 @@ func runProxyServer(
 	return kedahttp.ServeContext(ctx, kedahttp.ServerConfig{
 		Addr:         addr,
 		Handler:      rootHandler,
-		TLSConfig:    tlsCfg,
+		TLSConfig:    servingTLS,
 		DrainTimeout: serving.DrainTimeout,
 		Draining:     draining,
 	})

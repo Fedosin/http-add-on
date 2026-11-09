@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +28,8 @@ import (
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/queue"
 	routingtest "github.com/kedacore/http-add-on/pkg/routing/test"
+	"github.com/kedacore/http-add-on/pkg/testutil"
+	"github.com/kedacore/http-add-on/pkg/util"
 )
 
 const (
@@ -40,7 +44,8 @@ var testEndpointSlice = &discov1.EndpointSlice{
 		Namespace: "test-namespace",
 		Labels:    map[string]string{discov1.LabelServiceName: "test-service"},
 	},
-	Endpoints: []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
+	AddressType: discov1.AddressTypeIPv4,
+	Endpoints:   []discov1.Endpoint{{Addresses: []string{"1.2.3.4"}}},
 }
 
 func TestProxyHandler_SuccessfulRequest(t *testing.T) {
@@ -376,7 +381,8 @@ func newProxyTestHarness(t *testing.T, cfg harnessConfig) *proxyTestHarness {
 			ResponseHeader: 5 * time.Second,
 		},
 		Serving:             config.Serving{EnableColdStartHeader: cfg.enableColdStartHeader},
-		TLSConfig:           tlsCfg,
+		ServingTLS:          tlsCfg,
+		OutboundTLS:         tlsCfg,
 		Tracing:             config.Tracing{Enabled: cfg.tracingEnabled},
 		Instruments:         metrics.NewNoopInstruments(),
 		dialAddressOverride: backend.Listener.Addr().String(),
@@ -401,4 +407,100 @@ func (h *proxyTestHarness) doRequest(t *testing.T, method, path, host string) *h
 	h.Handler.ServeHTTP(rec, req)
 
 	return rec.Result()
+}
+
+// TestNewTLSDialer_UsesServerNameFromContext verifies the happy path: when
+// Routing has stamped UpstreamServerName, the dialer uses it as SNI regardless
+// of what the dial address is (e.g. a pod IP).
+func TestNewTLSDialer_UsesServerNameFromContext(t *testing.T) {
+	serverName := captureDialerSNI(
+		util.ContextWithUpstreamServerName(context.Background(), "myservice.default"),
+		t, &tls.Config{InsecureSkipVerify: true}, "10.1.2.3:8443")
+	if serverName != "myservice.default" {
+		t.Fatalf("ServerName = %q, want %q (should use context, not dial addr)", serverName, "myservice.default")
+	}
+}
+
+// TestNewTLSDialer_FallsBackToAddrHostname verifies that when the context has
+// no UpstreamServerName, the dialer extracts the hostname from the dial address
+// and uses it as ServerName for SNI.
+func TestNewTLSDialer_FallsBackToAddrHostname(t *testing.T) {
+	serverName := captureDialerSNI(context.Background(),
+		t, &tls.Config{InsecureSkipVerify: true}, "my-svc.default:8443")
+	if serverName != "my-svc.default" {
+		t.Fatalf("ServerName = %q, want %q (should fall back to addr hostname)", serverName, "my-svc.default")
+	}
+}
+
+// TestNewTLSDialer_PropagatesDialError verifies that errors from the
+// underlying TCP dialer surface unchanged — there's no swallow / wrap that
+// would mask a connection refusal or timeout.
+func TestNewTLSDialer_PropagatesDialError(t *testing.T) {
+	wantErr := errors.New("connection refused")
+	stubDial := func(_ context.Context, _, _ string) (net.Conn, error) {
+		return nil, wantErr
+	}
+	dialer := newTLSDialer(&tls.Config{InsecureSkipVerify: false}, stubDial)
+
+	ctx := util.ContextWithUpstreamServerName(context.Background(), "myservice.default")
+	conn, err := dialer(ctx, "tcp", "10.1.2.3:8443")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if conn != nil {
+		t.Error("returned conn must be nil on dial error")
+	}
+}
+
+// captureDialerSNI invokes newTLSDialer with a pipe-backed stub, initiates a
+// TLS handshake, and returns the ServerName the server saw in the ClientHello.
+// We only need the SNI from the first flight, so we abort via pipe close once
+// GetConfigForClient fires.
+func captureDialerSNI(ctx context.Context, t *testing.T, clientCfg *tls.Config, addr string) string {
+	t.Helper()
+	clientEnd, serverEnd := net.Pipe()
+
+	stubDial := func(_ context.Context, _, _ string) (net.Conn, error) {
+		return clientEnd, nil
+	}
+	dialer := newTLSDialer(clientCfg, stubDial)
+
+	sniCh := make(chan string, 1)
+	serverCert, _ := testutil.GenerateCert(t, nil, nil)
+	serverTLSCfg := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			sniCh <- hello.ServerName
+			return nil, nil
+		},
+	}
+
+	go func() {
+		srv := tls.Server(serverEnd, serverTLSCfg)
+		_ = srv.Handshake()
+		_ = srv.Close()
+	}()
+
+	conn, err := dialer(ctx, "tcp", addr)
+	if err != nil {
+		t.Fatalf("dialer error: %v", err)
+	}
+
+	// Drive the handshake just far enough for the server to receive ClientHello.
+	go func() {
+		tlsConn := conn.(*tls.Conn)
+		_ = tlsConn.Handshake()
+	}()
+
+	select {
+	case sni := <-sniCh:
+		_ = conn.Close()
+		_ = serverEnd.Close()
+		return sni
+	case <-time.After(5 * time.Second):
+		_ = conn.Close()
+		_ = serverEnd.Close()
+		t.Fatal("timed out waiting for TLS ClientHello")
+		return ""
+	}
 }

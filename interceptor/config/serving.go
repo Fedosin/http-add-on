@@ -31,23 +31,8 @@ type Serving struct {
 	TLSKeyPath string `env:"KEDA_HTTP_PROXY_TLS_KEY_PATH" envDefault:"/certs/tls.key"`
 	// TLSCertStorePaths is a comma separated list of paths to read the certificate/key pairs for the TLS server
 	TLSCertStorePaths string `env:"KEDA_HTTP_PROXY_TLS_CERT_STORE_PATHS" envDefault:""`
-	// TLSSkipVerify is a boolean flag to specify whether the interceptor should skip TLS verification for upstreams
-	TLSSkipVerify bool `env:"KEDA_HTTP_PROXY_TLS_SKIP_VERIFY" envDefault:"false"`
 	// TLSPort is the port that the server should serve on if TLS is enabled
 	TLSPort int `env:"KEDA_HTTP_PROXY_TLS_PORT" envDefault:"8443"`
-	// TLSMinVersion is the minimum TLS version to accept ("1.2" or "1.3").
-	// If empty, the Go default is used (currently TLS 1.2).
-	TLSMinVersion string `env:"KEDA_HTTP_PROXY_TLS_MIN_VERSION" envDefault:""`
-	// TLSMaxVersion is the maximum TLS version to accept ("1.2" or "1.3").
-	// Defaults to the highest version supported by crypto/tls if empty.
-	TLSMaxVersion string `env:"KEDA_HTTP_PROXY_TLS_MAX_VERSION" envDefault:""`
-	// TLSCipherSuites is a comma-separated list of TLS cipher suite names
-	// (e.g. "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384").
-	// If empty, the default Go cipher suites are used.
-	TLSCipherSuites string `env:"KEDA_HTTP_PROXY_TLS_CIPHER_SUITES" envDefault:""`
-	// TLSCurvePreferences is a comma-separated list of elliptic curve names
-	// (e.g. "X25519,CurveP256"). If empty, the default Go curve preferences are used.
-	TLSCurvePreferences string `env:"KEDA_HTTP_PROXY_TLS_CURVE_PREFERENCES" envDefault:""`
 
 	// ProfilingAddr if not empty, pprof will be available on this address, assuming host:port here
 	ProfilingAddr string `env:"PROFILING_BIND_ADDRESS" envDefault:""`
@@ -65,6 +50,20 @@ type Serving struct {
 	// server continues serving in-flight and new requests, giving Kubernetes
 	// time to propagate endpoint removal.
 	ShutdownDelay time.Duration `env:"KEDA_HTTP_SHUTDOWN_DELAY" envDefault:"5s"`
+	// DirectPodRouting routes requests to a ready pod IP instead of the Service
+	// ClusterIP, bypassing kube-proxy and other Service-layer features
+	// (NetworkPolicy, session affinity, topology-aware routing).
+	DirectPodRouting bool `env:"KEDA_HTTP_DIRECT_POD_ROUTING" envDefault:"true"`
+
+	// ColdStartMaxPendingRequests is the default limit on requests held per
+	// route while its backend has no ready endpoints (e.g. during
+	// scale-from-zero). Additional requests are rejected with 503 or served
+	// the route's placeholder response, per the route's coldStart.overflow.
+	// Routes override this default via coldStart.maxPendingRequests.
+	// 0 means unlimited. The limit applies per interceptor replica: the
+	// effective cluster-wide capacity is this value multiplied by the
+	// number of interceptor replicas.
+	ColdStartMaxPendingRequests int `env:"KEDA_HTTP_COLD_START_MAX_PENDING_REQUESTS" envDefault:"0"`
 }
 
 // MustParseServing parses standard configs and returns the

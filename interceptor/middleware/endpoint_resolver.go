@@ -2,12 +2,14 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/kedacore/http-add-on/interceptor/handler"
+	"github.com/kedacore/http-add-on/interceptor/metrics"
 	kedahttp "github.com/kedacore/http-add-on/pkg/http"
 	"github.com/kedacore/http-add-on/pkg/k8s"
 	"github.com/kedacore/http-add-on/pkg/util"
@@ -18,6 +20,8 @@ const defaultFallbackReadinessTimeout = 30 * time.Second
 type EndpointResolverConfig struct {
 	ReadinessTimeout      time.Duration
 	EnableColdStartHeader bool
+	DirectPodRouting      bool // route every request to a pod IP instead of the ClusterIP service
+	Instruments           *metrics.Instruments
 }
 
 type EndpointResolver struct {
@@ -64,7 +68,24 @@ func (er *EndpointResolver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	serviceKey := ir.Namespace + "/" + ir.Spec.Target.Service
-	isColdStart, err := er.readyCache.WaitForReady(waitCtx, serviceKey)
+	waitStart := time.Now()
+	isColdStart, podHost, err := er.readyCache.WaitForReady(waitCtx, serviceKey, util.UpstreamPortNameFromContext(ctx))
+	if info := routeInfoFromContext(ctx); info != nil {
+		// An error means the request waited for readiness but the backend did
+		// not become ready before the wait ended.
+		info.IsColdStart = isColdStart || err != nil
+	}
+
+	if er.cfg.Instruments != nil && (isColdStart || err != nil) {
+		outcome := metrics.ColdStartOutcomeReady
+		switch {
+		case errors.Is(err, context.Canceled):
+			outcome = metrics.ColdStartOutcomeCancelled
+		case err != nil:
+			outcome = metrics.ColdStartOutcomeTimeout
+		}
+		er.cfg.Instruments.RecordColdStartDuration(ir.Name, ir.Namespace, outcome, time.Since(waitStart))
+	}
 	if err != nil {
 		// No fallback, return an error
 		if !hasFallback {
@@ -90,12 +111,27 @@ func (er *EndpointResolver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Fall back to alternate upstream.
 		fallbackURL := util.FallbackURLFromContext(ctx)
 		ctx = util.ContextWithUpstreamURL(ctx, fallbackURL)
+		// Swapping to the fallback URL: refresh the SNI so TLS doesn't present
+		// the primary service's hostname (HTTP ignores ServerName).
+		if fallbackURL.Scheme == "https" {
+			ctx = util.ContextWithUpstreamServerName(ctx, fallbackURL.Hostname())
+		}
 		r = r.WithContext(ctx)
-	}
+	} else {
+		if er.cfg.EnableColdStartHeader {
+			w.Header().Set(kedahttp.HeaderColdStart, strconv.FormatBool(isColdStart))
+		}
 
-	// isColdStart is only meaningful when the backend resolved without errors
-	if err == nil && er.cfg.EnableColdStartHeader {
-		w.Header().Set(kedahttp.HeaderColdStart, strconv.FormatBool(isColdStart))
+		// Direct-pod routing: rewrite upstream to the pod IP (SNI stays the
+		// service hostname from context). Empty podHost leaves the URL as-is.
+		if er.cfg.DirectPodRouting && podHost != "" {
+			if upstreamURL := util.UpstreamURLFromContext(ctx); upstreamURL != nil {
+				podURL := *upstreamURL
+				podURL.Host = podHost
+				ctx = util.ContextWithUpstreamURL(ctx, &podURL)
+				r = r.WithContext(ctx)
+			}
+		}
 	}
 
 	er.next.ServeHTTP(w, r)

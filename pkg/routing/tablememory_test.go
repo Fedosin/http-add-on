@@ -5,7 +5,6 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	httpv1beta1 "github.com/kedacore/http-add-on/operator/apis/http/v1beta1"
 )
@@ -133,7 +132,7 @@ func TestRememberOldestWins(t *testing.T) {
 			Spec: httpv1beta1.InterceptorRouteSpec{
 				Rules: []httpv1beta1.RoutingRule{{
 					Hosts:   []string{"example.com"},
-					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: ptr.To("value")}},
+					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: new("value")}},
 				}},
 			},
 		}
@@ -145,7 +144,7 @@ func TestRememberOldestWins(t *testing.T) {
 			Spec: httpv1beta1.InterceptorRouteSpec{
 				Rules: []httpv1beta1.RoutingRule{{
 					Hosts:   []string{"example.com"},
-					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: ptr.To("value")}},
+					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: new("value")}},
 				}},
 			},
 		}
@@ -169,7 +168,7 @@ func TestRouteWithHeaders(t *testing.T) {
 			Rules: []httpv1beta1.RoutingRule{{
 				Hosts:   []string{"example.com"},
 				Paths:   []httpv1beta1.PathMatch{{Value: "/api/"}},
-				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: ptr.To("foo")}},
+				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: new("foo")}},
 			}},
 		},
 	}
@@ -179,7 +178,7 @@ func TestRouteWithHeaders(t *testing.T) {
 			Rules: []httpv1beta1.RoutingRule{{
 				Hosts:   []string{"example.com"},
 				Paths:   []httpv1beta1.PathMatch{{Value: "/other/"}},
-				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: ptr.To("foo")}},
+				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: new("foo")}},
 			}},
 		},
 	}
@@ -189,7 +188,7 @@ func TestRouteWithHeaders(t *testing.T) {
 			Rules: []httpv1beta1.RoutingRule{{
 				Hosts:   []string{"example.com"},
 				Paths:   []httpv1beta1.PathMatch{{Value: "/api/"}},
-				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: ptr.To("bar")}},
+				Headers: []httpv1beta1.HeaderMatch{{Name: "X-Custom-Header", Value: new("bar")}},
 			}},
 		},
 	}
@@ -219,8 +218,8 @@ func TestRouteWithHeaders(t *testing.T) {
 				Hosts: []string{"example.com"},
 				Paths: []httpv1beta1.PathMatch{{Value: "/api/"}},
 				Headers: []httpv1beta1.HeaderMatch{
-					{Name: "X-Custom-Header", Value: ptr.To("foo")},
-					{Name: "X-Another-Header", Value: ptr.To("baz")},
+					{Name: "X-Custom-Header", Value: new("foo")},
+					{Name: "X-Another-Header", Value: new("baz")},
 				},
 			}},
 		},
@@ -233,7 +232,7 @@ func TestRouteWithHeaders(t *testing.T) {
 				Paths: []httpv1beta1.PathMatch{{Value: "/api/"}},
 				Headers: []httpv1beta1.HeaderMatch{
 					{Name: "X-Custom-Header"},
-					{Name: "X-Another-Header", Value: ptr.To("baz")},
+					{Name: "X-Another-Header", Value: new("baz")},
 				},
 			}},
 		},
@@ -319,82 +318,6 @@ func TestRouteWithHeaders(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestHeadersMatch(t *testing.T) {
-	matchers := []httpv1beta1.HeaderMatch{
-		{Name: "X-Required-Header", Value: ptr.To("expected")},
-		{Name: "X-Key-Only-Header"},
-	}
-
-	tests := []struct {
-		name    string
-		headers map[string][]string
-		want    bool
-	}{
-		{
-			name:    "matches exact header",
-			headers: map[string][]string{"X-Required-Header": {"expected"}, "X-Key-Only-Header": {"any-value"}},
-			want:    true,
-		},
-		{
-			name:    "missing required but has key-only header",
-			headers: map[string][]string{"X-Key-Only-Header": {"any-value"}},
-			want:    false,
-		},
-		{
-			name:    "missing key-only header",
-			headers: map[string][]string{"X-Required-Header": {"expected"}},
-			want:    false,
-		},
-		{
-			name:    "wrong value for required header",
-			headers: map[string][]string{"X-Required-Header": {"wrong"}, "X-Key-Only-Header": {"any-value"}},
-			want:    false,
-		},
-		{
-			name:    "empty string as value",
-			headers: map[string][]string{"X-Required-Header": {"expected"}, "X-Key-Only-Header": {""}},
-			want:    true,
-		},
-		{
-			name:    "no headers provided",
-			headers: map[string][]string{},
-			want:    false,
-		},
-		{
-			name:    "extra headers provided",
-			headers: map[string][]string{"X-Required-Header": {"expected"}, "X-Key-Only-Header": {"any-value"}, "X-Extra-Header": {"extra"}},
-			want:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := headersMatch(matchers, tt.headers)
-			if result != tt.want {
-				t.Errorf("headersMatch()=%v, want=%v", result, tt.want)
-			}
-		})
-	}
-
-	emptyValueMatchers := []httpv1beta1.HeaderMatch{
-		{Name: "X-Empty-Value-Header", Value: ptr.To("")},
-	}
-
-	t.Run("matches empty string header value", func(t *testing.T) {
-		result := headersMatch(emptyValueMatchers, map[string][]string{"X-Empty-Value-Header": {""}})
-		if !result {
-			t.Error("expected headers to match")
-		}
-	})
-
-	t.Run("does not match non-empty string for empty value header", func(t *testing.T) {
-		result := headersMatch(emptyValueMatchers, map[string][]string{"X-Empty-Value-Header": {"non-empty"}})
-		if result {
-			t.Error("expected headers not to match")
-		}
-	})
 }
 
 func TestRoute(t *testing.T) {
@@ -697,12 +620,12 @@ func TestRouteMultipleRulesWithHeaders(t *testing.T) {
 				{
 					Hosts:   []string{"example.com"},
 					Paths:   []httpv1beta1.PathMatch{{Value: "/api/"}},
-					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Version", Value: ptr.To("v1")}},
+					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Version", Value: new("v1")}},
 				},
 				{
 					Hosts:   []string{"example.com"},
 					Paths:   []httpv1beta1.PathMatch{{Value: "/web/"}},
-					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Mode", Value: ptr.To("debug")}},
+					Headers: []httpv1beta1.HeaderMatch{{Name: "X-Mode", Value: new("debug")}},
 				},
 			},
 		},
