@@ -54,6 +54,7 @@ These files exist only in the downstream fork:
 
 - `.ci-operator.yaml` — OpenShift CI build root config
 - `.coderabbit.yaml` — CodeRabbit configuration
+- `.snyk` — OpenShift CI Snyk Code scan exclusions
 - `AGENTS.md` — This file
 - `CONTRIBUTING_OPENSHIFT.md` — Downstream contributing guide
 - `OWNERS` — OpenShift approver list

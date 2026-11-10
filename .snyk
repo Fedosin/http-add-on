@@ -1,0 +1,8 @@
+# OpenShift CI Snyk Code scan scope.
+version: v1.25.0
+exclude:
+  code:
+    # Third-party code is maintained through go.mod and go mod vendor.
+    - vendor/**
+    # The proxy harness intentionally accepts httptest's self-signed certificate.
+    - interceptor/proxy_test.go
