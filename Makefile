@@ -57,14 +57,6 @@ CONTROLLER_GEN ?= go tool controller-gen
 
 LOCALBIN ?= $(CURDIR)/bin
 
-# renovate: datasource=github-releases depName=golangci/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.12.2
-# renovate: datasource=github-releases depName=helm/helm
-HELM_VERSION ?= v4.2.3
-
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
-HELM          ?= $(LOCALBIN)/helm-$(HELM_VERSION)
-
 # TODO(v1): remove DOMAINS, ABC_DOMAINS, and the cert targets below when removing the legacy e2e tests.
 define DOMAINS
 basicConstraints=CA:FALSE
